@@ -26,7 +26,7 @@ from lerobot.utils.robot_utils import precise_sleep
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Replay recorded arm movements from CSV file"
+        description="Replay recorded arm or wheels movements from CSV file"
     )
     parser.add_argument(
         "--ip", type=str, required=True, help="Remote IP for the LeKiwi robot"
@@ -34,6 +34,13 @@ def main():
     parser.add_argument("--id", type=str, required=True, help="ID of the LeKiwi robot")
     parser.add_argument(
         "--name", type=str, required=True, help="Name of the recording to replay"
+    )
+    parser.add_argument(
+        "--type",
+        type=str,
+        required=True,
+        choices=["arm", "wheels"],
+        help="Type of recording: 'arm', 'wheels'",
     )
     parser.add_argument(
         "--fps", type=int, default=30, help="Frames per second for replay (default: 30)"
@@ -44,13 +51,14 @@ def main():
     robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id)
     robot = LeKiwiClient(robot_config)
 
-    # Build CSV filename from name
-    recordings_dir = os.path.join(
-        os.path.dirname(__file__), "..", "lekiwi", "recordings", "arm"
+    # Try to find the CSV file in both arm and wheels directories
+    recordings_base_dir = os.path.join(
+        os.path.dirname(__file__), "..", "lekiwi", "recordings"
     )
     csv_filename = f"{args.name}.csv"
-    csv_path = os.path.join(recordings_dir, csv_filename)
 
+    recording_type = args.type
+    csv_path = os.path.join(recordings_base_dir, recording_type, csv_filename)
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Recording not found: {csv_path}")
 
@@ -65,24 +73,44 @@ def main():
     if not robot.is_connected:
         raise ValueError("Robot is not connected!")
 
-    print(f"Replaying {len(actions)} actions from {csv_path}")
+    print(f"Replaying {len(actions)} actions from {csv_path} (type: {recording_type})")
     print("Starting replay loop...")
 
     for row in actions:
         t0 = time.perf_counter()
 
-        # Extract arm action data (exclude timestamp column)
-        arm_action = {
-            key: float(value) for key, value in row.items() if key != "timestamp"
-        }
+        if recording_type == "arm":
+            # Extract arm action data (exclude timestamp column)
+            arm_action = {
+                key: float(value) for key, value in row.items() if key != "timestamp"
+            }
 
-        # Add empty base velocities (robot expects both arm and base actions)
-        action = {
-            **arm_action,
-            "x.vel": 0.0,
-            "y.vel": 0.0,
-            "theta.vel": 0.0,
-        }
+            # Add empty base velocities (robot expects both arm and base actions)
+            action = {
+                **arm_action,
+                "x.vel": 0.0,
+                "y.vel": 0.0,
+                "theta.vel": 0.0,
+            }
+        else:  # wheels
+            # Extract base velocities (exclude timestamp column)
+            base_action = {
+                key: float(value) for key, value in row.items() if key != "timestamp"
+            }
+
+            present_position = robot.get_observation()
+            # Keep existing arm positions
+            arm_action = {
+                key: float(value)
+                for key, value in present_position.items()
+                if key.endswith(".pos")
+            }
+
+            # Keep existing arm position
+            action = {
+                **base_action,
+                **arm_action,
+            }
 
         # Send action to robot
         _ = robot.send_action(action)
@@ -95,5 +123,6 @@ def main():
 
 if __name__ == "__main__":
     # How to run:
-    # python -m scripts.replay --ip 172.20.10.2 --id biden_kiwi --name test_arm
+    # python -m scripts.replay --ip 172.20.10.2 --id biden_kiwi --name test_arm --type arm
+    # python -m scripts.replay --ip 172.20.10.2 --id biden_kiwi --name test_wheels --type wheels
     main()

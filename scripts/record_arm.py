@@ -8,8 +8,6 @@ from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from lerobot.teleoperators.so100_leader import SO100Leader, SO100LeaderConfig
 from lerobot.utils.robot_utils import precise_sleep
 
-# TODO: IMPLEMENT TORQUE DISABLE FOR ARM MOTORS WHEN IN MANUAL MODE
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -20,12 +18,18 @@ def main():
     )
     parser.add_argument("--id", type=str, required=True, help="ID of the lekiwi robot")
     parser.add_argument("--name", type=str, required=True, help="Name of the recording")
-    # These are optional if you are not teleoperating the leader arm
+    # Teleoperator
     parser.add_argument(
-        "--port", type=str, help="Serial port for the leader arm (if teleoperating)"
+        "--port",
+        type=str,
+        required=True,
+        help="Serial port for the leader arm (if teleoperating)",
     )
     parser.add_argument(
-        "--leader_id", type=str, help="ID of the leader arm (if teleoperating)"
+        "--leader_id",
+        type=str,
+        required=True,
+        help="ID of the leader arm (if teleoperating)",
     )
     parser.add_argument(
         "--fps",
@@ -40,19 +44,9 @@ def main():
     robot = LeKiwiClient(robot_config)
     robot.connect()  # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
 
-    # Initialize leader arm if provided
-    leader_arm = None
-    use_leader_mode = args.port is not None and args.leader_id is not None
-
-    if use_leader_mode:
-        leader_arm_config = SO100LeaderConfig(port=args.port, id=args.leader_id)
-        leader_arm = SO100Leader(leader_arm_config)
-        leader_arm.connect()
-        print(
-            f"Using the leader arm {args.leader_id} on port {args.port}, use leader arm to record actions"
-        )
-    else:
-        print("Using manual mode - manually move the follower arm to record actions")
+    leader_arm_config = SO100LeaderConfig(port=args.port, id=args.leader_id)
+    leader_arm = SO100Leader(leader_arm_config)
+    leader_arm.connect()
 
     input("Press Enter to start recording...")
 
@@ -81,20 +75,16 @@ def main():
             while True:
                 t0 = time.perf_counter()
 
-                if use_leader_mode:
-                    leader_action = leader_arm.get_action()  # type: ignore[attribute-error]
-                    obs = {f"arm_{key}": val for key, val in leader_action.items()}
-                    # Add empty base velocities (robot expects both arm and base actions)
-                    action = {
-                        **obs,
-                        "x.vel": 0.0,
-                        "y.vel": 0.0,
-                        "theta.vel": 0.0,
-                    }
-                    robot.send_action(action)
-                else:
-                    robot_obs = robot.get_observation()
-                    obs = {k: v for k, v in robot_obs.items() if k in arm_keys}
+                leader_action = leader_arm.get_action()  # type: ignore[attribute-error]
+                obs = {f"arm_{key}": val for key, val in leader_action.items()}
+                # Add empty base velocities (robot expects both arm and base actions)
+                action = {
+                    **obs,
+                    "x.vel": 0.0,
+                    "y.vel": 0.0,
+                    "theta.vel": 0.0,
+                }
+                robot.send_action(action)
 
                 if csv_writer is None:
                     fieldnames = ["timestamp"] + arm_keys
