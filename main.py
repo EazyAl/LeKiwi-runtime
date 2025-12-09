@@ -1,28 +1,22 @@
 import logging
+import os
 
 from dotenv import load_dotenv
 from livekit import rtc, agents
 from livekit.agents import (
     Agent,
     RoomInputOptions,
-    # AgentServer,
     AgentSession,
-    # JobContext,
-    # JobProcess,
-    # cli,
-    # inference,
-    # room_io,
     function_tool,
-    # RunContext,
 )
 from livekit.plugins import (
     openai,
     noise_cancellation,
+    elevenlabs,
 )
 from lekiwi.services.motors import ArmsService, WheelsService
 
 load_dotenv()
-
 
 class LeKiwi(Agent):
     def __init__(self, port: str = "/dev/ttyACM0", robot_id: str = "biden_kiwi"):
@@ -120,7 +114,14 @@ You ONLY speak English. Never respond in any other language. If audio is unclear
 async def entrypoint(ctx: agents.JobContext):
     agent = LeKiwi()
 
-    session = AgentSession(llm=openai.realtime.RealtimeModel(voice="sage"))
+    session = AgentSession(
+        llm=openai.LLM(),
+        stt=openai.STT(),
+        tts=elevenlabs.TTS(
+            voice_id="fSD2ACcr725aTcyIRKEg",
+            model="eleven_multilingual_v2",
+        ),
+    )
 
     await session.start(
         room=ctx.room,

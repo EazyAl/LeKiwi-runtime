@@ -180,7 +180,8 @@ class ArmsService:
             # Play current frame
             if self._current_frame_index < len(self._current_actions):
                 action = self._current_actions[self._current_frame_index]
-                self.robot.send_action(action)
+                prepared_action = self._prepare_action(action)
+                self.robot.send_action(prepared_action)
                 self._current_state = action.copy()
                 self._current_frame_index += 1
             else:

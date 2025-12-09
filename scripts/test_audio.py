@@ -7,6 +7,7 @@ Plays the tars.wav file with the TARS-like robotic voice effect.
 import subprocess
 import sys
 import os
+import tempfile
 from pathlib import Path
 
 # Get the script directory and construct path to assets
@@ -21,6 +22,51 @@ def check_sox_installed():
         subprocess.run(["sox", "--version"], capture_output=True, check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def validate_audio_file(audio_file: Path):
+    """Validate audio file using soxi. Returns True if valid, False otherwise."""
+    try:
+        result = subprocess.run(
+            ["soxi", str(audio_file)], capture_output=True, check=True
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def convert_audio_file(input_file: Path, output_file: Path):
+    """Convert audio file to a valid WAV format using sox.
+    Tries auto-detection first, then explicit format specification if needed.
+    """
+    # First try auto-detection (sox will try to detect format automatically)
+    try:
+        result = subprocess.run(
+            ["sox", str(input_file), "-t", "wav", str(output_file)],
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        # If auto-detection fails, try common audio formats
+        formats_to_try = ["wav", "mp3", "ogg", "flac", "aiff", "au", "raw"]
+        for fmt in formats_to_try:
+            try:
+                result = subprocess.run(
+                    ["sox", "-t", fmt, str(input_file), "-t", "wav", str(output_file)],
+                    capture_output=True,
+                    check=True,
+                )
+                print(f"  Detected format: {fmt}")
+                return True
+            except subprocess.CalledProcessError:
+                continue
+
+        # If all formats fail, return False
+        print(
+            f"Error: Could not convert audio file. File may be corrupted or in unsupported format."
+        )
         return False
 
 
@@ -40,11 +86,33 @@ def play_tars_audio(audio_file: Path):
         print(f"Error: Audio file not found at {audio_file}")
         return False
 
+    # Validate the audio file first
+    if not validate_audio_file(audio_file):
+        print(f"Warning: Audio file appears to be invalid or corrupted.")
+        print(f"Attempting to convert {audio_file.name} to valid WAV format...")
+
+        # Create a temporary converted file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            converted_file = Path(tmp_file.name)
+
+        if not convert_audio_file(audio_file, converted_file):
+            print(f"Error: Failed to convert audio file. The file may be corrupted.")
+            return False
+
+        print(f"✓ Successfully converted audio file")
+        # Use the converted file for playback
+        audio_file = converted_file
+        # Clean up temp file after playback
+        cleanup_file = converted_file
+    else:
+        cleanup_file = None
+
     print(f"Playing {audio_file.name} with TARS effect...")
     print("Press Ctrl+C to stop playback\n")
 
     try:
         # Build the play command with TARS effect
+        # Note: -t before reverb is the tail time parameter, not a format specifier
         cmd = [
             "play",
             str(audio_file),
@@ -76,13 +144,30 @@ def play_tars_audio(audio_file: Path):
         # Run the play command
         subprocess.run(cmd, check=True)
         print("\nPlayback completed successfully!")
+
+        # Clean up temporary converted file if created
+        if cleanup_file and cleanup_file.exists():
+            cleanup_file.unlink()
+
         return True
 
     except subprocess.CalledProcessError as e:
         print(f"Error running play command: {e}")
+        if e.stderr:
+            print(f"Error details: {e.stderr.decode()}")
+
+        # Clean up temporary converted file if created
+        if cleanup_file and cleanup_file.exists():
+            cleanup_file.unlink()
+
         return False
     except KeyboardInterrupt:
         print("\n\nPlayback interrupted by user.")
+
+        # Clean up temporary converted file if created
+        if cleanup_file and cleanup_file.exists():
+            cleanup_file.unlink()
+
         return False
 
 
