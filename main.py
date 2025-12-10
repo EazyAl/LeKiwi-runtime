@@ -1,6 +1,7 @@
 import logging
 import os
 from pathlib import Path
+import time
 
 from dotenv import load_dotenv
 from livekit import rtc, agents
@@ -22,6 +23,7 @@ from lekiwi.services.pose_detection import (
     PoseEstimator,
     FallDetector,
 )
+import zmq
 
 load_dotenv()
 
@@ -43,7 +45,13 @@ def _load_system_prompt() -> str:
 
 
 class LeKiwi(Agent):
-    def __init__(self, port: str = "/dev/ttyACM0", robot_id: str = "biden_kiwi"):
+    def __init__(
+        self,
+        port: str = "/dev/ttyACM0",
+        robot_id: str = "biden_kiwi",
+        stream_data: bool = False,
+        stream_port: int = 5556,
+    ):
         super().__init__(instructions=_load_system_prompt())
         # Three services running on separate threads, with LeKiwi agent dispatching events to them
         self.wheels_service = WheelsService(port=port, robot_id=robot_id)
@@ -62,8 +70,25 @@ class LeKiwi(Agent):
         self.arms_service.start()
         self.pose_service.start()
 
+        # Optional data streaming (to anyone listening)
+        # TODO: This should probably exist in the pose detection worker thread instead
+        self.stream_data = stream_data
+        self.zmq_pub = None
+        if stream_data:
+            context = zmq.Context()
+            self.zmq_pub = context.socket(zmq.PUB)
+            self.zmq_pub.setsockopt(zmq.CONFLATE, 1)
+            self.zmq_pub.bind(f"tcp://*:{stream_port}")
+            print(f"ZMQ Publisher on LeKiwi bound to port {stream_port}")
+
         # Wake up
         self.arms_service.dispatch("play", "wake_up")
+
+    def _publish_sensor_data(self, data_type: str, data: dict):
+        """Publish sensor data to ZMQ stream if enabled."""
+        if self.zmq_pub:
+            message = {"type": data_type, "timestamp": time.time(), "data": data}
+            self.zmq_pub.send_json(message)
 
     def _handle_pose_status(self, status_type: str, details: dict):
         """
@@ -73,6 +98,17 @@ class LeKiwi(Agent):
         print(
             f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
         )
+
+        # Stream pose data if enabled
+        if self.stream_data:
+            self._publish_sensor_data(
+                "pose",
+                {
+                    "status": status_type,
+                    "score": details.get("score", 0.0),
+                    "ratio": details.get("ratio", 0.0),
+                },
+            )
 
         if status_type == "PERSON_FALLEN":
             # The main thread (LiveKit orchestrator) decides what to do
@@ -152,7 +188,16 @@ class LeKiwi(Agent):
 
 # Entry to the agent
 async def entrypoint(ctx: agents.JobContext):
-    agent = LeKiwi()
+    # Parse command-line args to get stream settings
+    import sys
+
+    stream_enabled = "--stream" in sys.argv
+    stream_port = 5556
+    for i, arg in enumerate(sys.argv):
+        if arg == "--stream-port" and i + 1 < len(sys.argv):
+            stream_port = int(sys.argv[i + 1])
+
+    agent = LeKiwi(stream_data=stream_enabled, stream_port=stream_port)
 
     session = AgentSession(llm=openai.realtime.RealtimeModel(voice="verse"))
 
@@ -172,6 +217,16 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stream", action="store_true", help="Enable data streaming for visualization"
+    )
+    parser.add_argument(
+        "--stream-port", type=int, default=5556, help="Port for ZMQ data streaming"
+    )
+    args, unknown = parser.parse_known_args()
     agents.cli.run_app(
         agents.WorkerOptions(entrypoint_fnc=entrypoint, num_idle_processes=1)
     )

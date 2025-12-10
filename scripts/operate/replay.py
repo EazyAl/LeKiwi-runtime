@@ -17,6 +17,7 @@
 import argparse
 import csv
 import os
+import sys
 import time
 
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
@@ -29,9 +30,11 @@ def main():
         description="Replay recorded arm or wheels movements from CSV file"
     )
     parser.add_argument(
-        "--ip", type=str, required=True, help="Remote IP for the LeKiwi robot"
+        "--ip", type=str, default="172.20.10.2", help="Remote IP for the LeKiwi robot"
     )
-    parser.add_argument("--id", type=str, required=True, help="ID of the LeKiwi robot")
+    parser.add_argument(
+        "--id", type=str, default="biden_kiwi", help="ID of the LeKiwi robot"
+    )
     parser.add_argument(
         "--name", type=str, required=True, help="Name of the recording to replay"
     )
@@ -40,7 +43,7 @@ def main():
         type=str,
         required=True,
         choices=["arm", "wheels"],
-        help="Type of recording: 'arm', 'wheels'",
+        help="Type of recording: 'arm' or 'wheels'",
     )
     parser.add_argument(
         "--fps", type=int, default=30, help="Frames per second for replay (default: 30)"
@@ -122,7 +125,9 @@ def main():
 
 
 if __name__ == "__main__":
-    # How to run:
-    # python -m scripts.replay --ip 172.20.10.2 --id biden_kiwi --name test_arm --type arm
-    # python -m scripts.replay --ip 172.20.10.2 --id biden_kiwi --name test_wheels --type wheels
+    # How to run (with defaults):
+    # python -m scripts.operate.replay --name test_arm --type arm
+    # python -m scripts.operate.replay --name test_wheels --type wheels
+    # Or override defaults:
+    # python -m scripts.operate.replay --name test_arm --type arm --ip 172.20.10.3
     main()

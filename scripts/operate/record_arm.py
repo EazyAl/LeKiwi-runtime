@@ -1,31 +1,37 @@
 import argparse
-import time
 import csv
 import os
-
-import numpy as np
+import sys
+import time
 
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
 from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
-from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
+from lerobot.teleoperators.so100_leader import SO100Leader, SO100LeaderConfig
 from lerobot.utils.robot_utils import precise_sleep
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Record an action sequence for LeKiwi's wheels using keyboard control"
+        description="Record an action sequence for LeKiwi's leader arm"
     )
     parser.add_argument(
-        "--ip", type=str, required=True, help="Remote ip for the lekiwi robot"
+        "--ip", type=str, default="172.20.10.2", help="Remote IP for the LeKiwi robot"
     )
-    parser.add_argument("--id", type=str, required=True, help="ID of the lekiwi robot")
+    parser.add_argument(
+        "--id", type=str, default="biden_kiwi", help="ID of the LeKiwi robot"
+    )
     parser.add_argument("--name", type=str, required=True, help="Name of the recording")
     parser.add_argument(
-        "--keyboard_id",
+        "--port",
         type=str,
-        default="my_laptop_keyboard",
-        help="ID of the keyboard teleoperator (default: my_laptop_keyboard)",
+        default="/dev/tty.usbmodem5AB90687441",
+        help="Serial port for the leader arm",
+    )
+    parser.add_argument(
+        "--leader_id",
+        type=str,
+        default="obama_leader",
+        help="ID of the leader arm",
     )
     parser.add_argument(
         "--fps",
@@ -40,14 +46,14 @@ def main():
     robot = LeKiwiClient(robot_config)
     robot.connect()  # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
 
-    keyboard_config = KeyboardTeleopConfig(id=args.keyboard_id)
-    keyboard = KeyboardTeleop(keyboard_config)
-    keyboard.connect()
+    leader_arm_config = SO100LeaderConfig(port=args.port, id=args.leader_id)
+    leader_arm = SO100Leader(leader_arm_config)
+    leader_arm.connect()
 
     input("Press Enter to start recording...")
 
     recordings_dir = os.path.join(
-        os.path.dirname(__file__), "..", "lekiwi", "recordings", "wheels"
+        os.path.dirname(__file__), "..", "lekiwi", "recordings", "arm"
     )
     os.makedirs(recordings_dir, exist_ok=True)
 
@@ -55,10 +61,13 @@ def main():
 
     # TODO(Victor): consider using 'make_default_processors()' from HF to use the HF dataset format as practice
     # Would use this together with record_loop from lerobot_record.py to record the actions
-    wheel_keys = [
-        "x.vel",
-        "y.vel",
-        "theta.vel",
+    arm_keys = [
+        "arm_shoulder_pan.pos",
+        "arm_shoulder_lift.pos",
+        "arm_elbow_flex.pos",
+        "arm_wrist_flex.pos",
+        "arm_wrist_roll.pos",
+        "arm_gripper.pos",
     ]
 
     with open(csv_filename, "w", newline="") as csvfile:
@@ -68,34 +77,25 @@ def main():
             while True:
                 t0 = time.perf_counter()
 
-                keyboard_keys = keyboard.get_action()
-                # Convert dict keys to numpy array for _from_keyboard_to_base_action
-                pressed_keys_array = np.array(list(keyboard_keys.keys()))
-                base_action = robot._from_keyboard_to_base_action(pressed_keys_array)
-
-                # Keep existing arm positions
-                present_position = robot.get_observation()
-                arm_action = {
-                    key: float(value)
-                    for key, value in present_position.items()
-                    if key.endswith(".pos")
-                }
-
-                # Keep existing arm position
+                leader_action = leader_arm.get_action()  # type: ignore[attribute-error]
+                obs = {f"arm_{key}": val for key, val in leader_action.items()}
+                # Add empty base velocities (robot expects both arm and base actions)
                 action = {
-                    **base_action,
-                    **arm_action,
+                    **obs,
+                    "x.vel": 0.0,
+                    "y.vel": 0.0,
+                    "theta.vel": 0.0,
                 }
                 robot.send_action(action)
 
                 if csv_writer is None:
-                    fieldnames = ["timestamp"] + wheel_keys
+                    fieldnames = ["timestamp"] + arm_keys
                     csv_writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     csv_writer.writeheader()
 
                 row = {"timestamp": t0}
-                for key in wheel_keys:
-                    row[key] = base_action.get(key, 0.0)
+                for key in arm_keys:
+                    row[key] = obs.get(key, 0.0)
                 csv_writer.writerow(row)
                 csvfile.flush()
 
@@ -105,12 +105,14 @@ def main():
             print("Shutting down teleop...")
         finally:
             robot.disconnect()
-            if keyboard is not None:
-                keyboard.disconnect()
+            if leader_arm is not None:
+                leader_arm.disconnect()
             print(f"Recording saved to {csv_filename}")
 
 
 if __name__ == "__main__":
-    # How to run:
-    # python -m scripts.record_wheels --ip 172.20.10.2 --id biden_kiwi --name test_wheels
+    # How to run (with defaults):
+    # python -m scripts.operate.record_arm --name test_arm
+    # Or override defaults:
+    # python -m scripts.operate.record_arm --name test_arm --ip 172.20.10.3 --port /dev/ttyUSB0
     main()

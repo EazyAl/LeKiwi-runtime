@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+import sys
 import time
 
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
@@ -29,12 +31,39 @@ FPS = 30
 
 
 def main():
-    # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="172.20.10.2", id="biden_kiwi")
-    teleop_arm_config = SO100LeaderConfig(
-        port="/dev/tty.usbmodem5AB90687441", id="obama_leader"
+    parser = argparse.ArgumentParser(
+        description="Teleoperate LeKiwi with leader arm and keyboard"
     )
-    keyboard_config = KeyboardTeleopConfig(id="my_laptop_keyboard")
+    parser.add_argument(
+        "--ip", type=str, default="172.20.10.2", help="Remote IP for the LeKiwi robot"
+    )
+    parser.add_argument(
+        "--id", type=str, default="biden_kiwi", help="ID of the LeKiwi robot"
+    )
+    parser.add_argument(
+        "--port",
+        type=str,
+        default="/dev/tty.usbmodem5AB90687441",
+        help="Serial port for the leader arm",
+    )
+    parser.add_argument(
+        "--leader_id",
+        type=str,
+        default="obama_leader",
+        help="ID of the leader arm",
+    )
+    parser.add_argument(
+        "--keyboard_id",
+        type=str,
+        default="my_laptop_keyboard",
+        help="ID of the keyboard teleoperator",
+    )
+    args = parser.parse_args()
+
+    # Create the robot and teleoperator configurations
+    robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id)
+    teleop_arm_config = SO100LeaderConfig(port=args.port, id=args.leader_id)
+    keyboard_config = KeyboardTeleopConfig(id=args.keyboard_id)
 
     # Initialize the robot and teleoperator
     robot = LeKiwiClient(robot_config)
@@ -42,7 +71,6 @@ def main():
     keyboard = KeyboardTeleop(keyboard_config)
 
     # Connect to the robot and teleoperator
-    # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
     robot.connect()
     leader_arm.connect()
     keyboard.connect()
