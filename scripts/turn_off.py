@@ -9,7 +9,7 @@ from lerobot.robots.lekiwi import LeKiwiConfig, LeKiwi
 
 def turn_off(port: str, robot_id: str):
     # Initialize robot connection
-    robot_config = LeKiwiConfig(port=port, id=robot_id)
+    robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
     robot = LeKiwi(robot_config)
 
     try:

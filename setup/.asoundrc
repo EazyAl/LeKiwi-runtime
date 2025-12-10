@@ -1,0 +1,47 @@
+# Default device using 'plug' to handle Rate and Channel conversion automatically
+# This fixes "Invalid sample rate" and "Channels count non available" errors
+pcm.!default {
+    type asym
+    playback.pcm {
+        type plug
+        slave {
+            pcm "hw:2,0"
+            rate 16000
+            channels 2
+        }
+    }
+    capture.pcm {
+        type plug
+        slave {
+            pcm "hw:2,0"
+            rate 16000
+            channels 2
+        }
+    }
+}
+
+# Explicit capture device
+pcm.!capture {
+    type plug
+    slave {
+        pcm "hw:2,0"
+        rate 16000
+        channels 2
+    }
+}
+
+# Explicit playback device
+pcm.!playback {
+    type plug
+    slave {
+        pcm "hw:2,0"
+        rate 16000
+        channels 2
+    }
+}
+
+ctl.!default {
+    type hw
+    card 2
+}
+

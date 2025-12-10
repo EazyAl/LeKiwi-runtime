@@ -121,7 +121,7 @@ amixer -c 2 cset numid=30,iface=MIXER,name='ALC Hold Time' 5
 For recording:
 
 ```bash
-arecord -D hw:2,0 -f S16_LE -r 16000 -c 2 recording.wav
+arecord -D hw:2,0 -f S16_LE -r 16000 -c 2 audio.wav
 ```
 
 Always do it at 16kHz to avoid high frequency digital noise (it's ideal for recording voices). You press ctrl + C to stop recording
@@ -135,11 +135,11 @@ sudo apt install sox libsox-fmt-all
 ```bash
 # Play audio file with TARS-like effect
 play audio.wav \
-  highpass 300 \
-  lowpass 3000 \
-  compand 0.01,0.20 -60,-40,-10 -5 -90 0.1 \
-  chorus 0.7 0.9 55 0.4 0.25 2 -t \
-  reverb 10 \
+  highpass 600 \
+  lowpass 2500 \
+  overdrive 10 \
+  compand 0.1,0.3 -60,-40,-10,-5 -5 -90 0.1 \
+  echo 0.8 0.8 2 0.4 \
   gain -n -3
 ```
 
