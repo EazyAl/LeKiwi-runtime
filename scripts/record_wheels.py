@@ -36,7 +36,7 @@ def main():
     args = parser.parse_args()
 
     # Create the robot configuration
-    robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id)
+    robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id, cameras={})
     robot = LeKiwiClient(robot_config)
     robot.connect()  # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
 
