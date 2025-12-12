@@ -2,7 +2,7 @@
 """
 Record episodes with LeKiwi robot for training.
 Captures: Pi cameras (front, wrist) + Mac top-down camera + arm actions.
-Saves in lerobot dataset format for Hugging Face upload.
+Saves episodes to disk incrementally, then uploads to Hugging Face.
 
 Controls:
   - ENTER: Start recording
@@ -13,12 +13,14 @@ Controls:
 import argparse
 import time
 import os
+import json
+import shutil
 from pathlib import Path
 
 import cv2
 import numpy as np
-from datasets import Dataset, Features, Image, Sequence, Value
-from huggingface_hub import HfApi
+from PIL import Image
+from huggingface_hub import HfApi, create_repo
 
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.teleoperators.so100_leader import SO100Leader, SO100LeaderConfig
@@ -26,6 +28,55 @@ from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, Keybo
 from lerobot.utils.robot_utils import precise_sleep
 
 FPS = 30
+
+
+def save_episode_to_disk(episode_data, episode_idx, output_dir):
+    """Save a single episode to disk immediately to avoid memory issues."""
+    episode_dir = output_dir / f"episode_{episode_idx:04d}"
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save images
+    for cam_name in ["front", "wrist", "top_down"]:
+        cam_dir = episode_dir / cam_name
+        cam_dir.mkdir(exist_ok=True)
+        key = f"observation.image.{cam_name}"
+        for i, img in enumerate(episode_data[key]):
+            img_path = cam_dir / f"frame_{i:06d}.jpg"
+            Image.fromarray(img).save(img_path, quality=85)
+    
+    # Save metadata (state, action, timestamp)
+    metadata = {
+        "state": episode_data["observation.state"],
+        "action": episode_data["action"],
+        "timestamp": episode_data["timestamp"],
+        "num_frames": len(episode_data["timestamp"]),
+    }
+    with open(episode_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f)
+    
+    return episode_dir
+
+
+def upload_dataset(output_dir, repo_id, num_episodes):
+    """Upload saved episodes to Hugging Face."""
+    print(f"\nUploading {num_episodes} episodes to HuggingFace...")
+    
+    api = HfApi()
+    
+    # Create repo if it doesn't exist
+    try:
+        create_repo(repo_id, repo_type="dataset", exist_ok=True)
+    except Exception as e:
+        print(f"Note: {e}")
+    
+    # Upload the entire output directory
+    api.upload_folder(
+        folder_path=str(output_dir),
+        repo_id=repo_id,
+        repo_type="dataset",
+    )
+    
+    print(f"Dataset uploaded to: https://huggingface.co/datasets/{repo_id}")
 
 
 def main():
@@ -38,7 +89,16 @@ def main():
     parser.add_argument("--num_episodes", type=int, default=10, help="Number of episodes to record")
     parser.add_argument("--max_episode_length", type=int, default=9000, help="Max frames per episode (default 9000 = 5min at 30fps)")
     parser.add_argument("--top_down_camera", type=int, default=0, help="Mac top-down camera index")
+    parser.add_argument("--output_dir", type=str, default="./recorded_episodes", help="Local directory to save episodes")
     args = parser.parse_args()
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    if output_dir.exists():
+        response = input(f"Output directory {output_dir} exists. Delete and start fresh? (y/n): ")
+        if response.lower() == 'y':
+            shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup robot and teleoperators
     robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id)
@@ -62,13 +122,14 @@ def main():
         print(f"Warning: Could not open top-down camera (index {args.top_down_camera})")
 
     print(f"\nReady to record {args.num_episodes} episodes")
+    print(f"Episodes will be saved to: {output_dir}")
     print("Controls:")
     print("  - Press ENTER to start recording")
     print("  - Press Ctrl+C to end episode")
     print("  - After episode: type 's' to save, 'r' to re-record, 'q' to quit\n")
 
-    all_episodes = []
     episode_idx = 0
+    saved_episodes = 0
 
     try:
         while episode_idx < args.num_episodes:
@@ -141,7 +202,7 @@ def main():
                         action.get("theta.vel", 0.0),
                     ]
                     
-                    # Store data
+                    # Store data in memory (will save to disk after episode)
                     episode_data["observation.image.front"].append(front_img)
                     episode_data["observation.image.wrist"].append(wrist_img)
                     episode_data["observation.image.top_down"].append(top_frame_rgb)
@@ -169,16 +230,21 @@ def main():
             while True:
                 choice = input("Save (s), Re-record (r), or Quit (q)? ").lower().strip()
                 if choice == 's':
-                    episode_data["episode_index"] = [episode_idx] * frame_idx
-                    episode_data["frame_index"] = list(range(frame_idx))
-                    all_episodes.append(episode_data)
-                    print(f"Episode {episode_idx + 1} saved!")
+                    # Save to disk immediately
+                    print(f"Saving episode {episode_idx + 1} to disk...")
+                    save_episode_to_disk(episode_data, saved_episodes, output_dir)
+                    print(f"Episode {episode_idx + 1} saved to disk!")
                     episode_idx += 1
+                    saved_episodes += 1
+                    # Clear memory
+                    del episode_data
                     break
                 elif choice == 'r':
                     print("Re-recording episode...")
+                    del episode_data
                     break
                 elif choice == 'q':
+                    del episode_data
                     raise KeyboardInterrupt
                 else:
                     print("Please enter 's', 'r', or 'q'")
@@ -192,31 +258,25 @@ def main():
     leader_arm.disconnect()
     keyboard.disconnect()
 
-    if len(all_episodes) > 0:
-        print(f"\nSaving {len(all_episodes)} episodes to HuggingFace...")
-        
-        # Flatten all episodes into single lists
-        flat_data = {
-            "observation.image.front": [],
-            "observation.image.wrist": [],
-            "observation.image.top_down": [],
-            "observation.state": [],
-            "action": [],
-            "timestamp": [],
-            "episode_index": [],
-            "frame_index": [],
+    if saved_episodes > 0:
+        # Save dataset info
+        info = {
+            "num_episodes": saved_episodes,
+            "fps": FPS,
+            "cameras": ["front", "wrist", "top_down"],
         }
+        with open(output_dir / "info.json", "w") as f:
+            json.dump(info, f, indent=2)
         
-        for ep in all_episodes:
-            for key in flat_data.keys():
-                flat_data[key].extend(ep[key])
+        print(f"\n{saved_episodes} episodes saved locally to {output_dir}")
         
-        # Create dataset
-        dataset = Dataset.from_dict(flat_data)
-        
-        # Push to hub
-        dataset.push_to_hub(args.repo_id, private=False)
-        print(f"Dataset uploaded to: https://huggingface.co/datasets/{args.repo_id}")
+        # Ask to upload
+        upload = input("Upload to HuggingFace now? (y/n): ").lower().strip()
+        if upload == 'y':
+            upload_dataset(output_dir, args.repo_id, saved_episodes)
+        else:
+            print(f"You can upload later with:")
+            print(f"  huggingface-cli upload {args.repo_id} {output_dir} --repo-type dataset")
     else:
         print("No episodes recorded")
 
