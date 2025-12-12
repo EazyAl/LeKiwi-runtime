@@ -18,6 +18,9 @@ import argparse
 import sys
 import time
 
+import cv2
+import rerun as rr
+
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.teleoperators.keyboard.teleop_keyboard import (
     KeyboardTeleop,
@@ -78,6 +81,11 @@ def main():
     # Init rerun viewer
     init_rerun(session_name="lekiwi_teleop")
 
+    # Open Mac's top-down camera (external USB camera)
+    top_down_cam = cv2.VideoCapture(0)
+    if not top_down_cam.isOpened():
+        print("Warning: Could not open top-down camera (index 1)")
+
     if (
         not robot.is_connected
         or not leader_arm.is_connected
@@ -108,7 +116,18 @@ def main():
         # Visualize
         log_rerun_data(observation=observation, action=action)
 
+        # Show top-down camera from Mac in Rerun
+        ret, top_frame = top_down_cam.read()
+        if ret:
+            # Convert BGR to RGB for Rerun
+            top_frame_rgb = cv2.cvtColor(top_frame, cv2.COLOR_BGR2RGB)
+            rr.log("observation/top_down", rr.Image(top_frame_rgb))
+
         precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+
+    # Cleanup
+    top_down_cam.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
