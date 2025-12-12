@@ -115,6 +115,33 @@ class LeKiwiObserver:
             if landmarks.size > 0:
                 rr.log("pose/landmarks", rr.Points3D(landmarks))
 
+        # Face-related stats (optional)
+        face_stats = {
+            "awake": data.get("awake_likelihood"),
+            "blinks_per_min": data.get("blinks_per_min"),
+            "perclos": data.get("perclos"),
+            "eyes_open_prob": data.get("eyes_open_prob"),
+            "hr_bpm": data.get("hr_bpm"),
+            "hr_quality": data.get("hr_quality"),
+            "hr_method": data.get("hr_method"),
+            "face_status": data.get("face_status"),
+        }
+        self._log_data("pose/face_stats", face_stats)
+
+        face_box = data.get("face_box")
+        if isinstance(face_box, (list, tuple)) and len(face_box) == 4:
+            x0, y0, x1, y1 = face_box
+            rr.log("pose/face_box", rr.Boxes2D(mins=[[x0, y0]], sizes=[[x1 - x0, y1 - y0]], colors=[[0, 255, 255]]))
+
+        face_landmarks = data.get("face_landmarks")
+        if isinstance(face_landmarks, (list, np.ndarray)):
+            pts = np.array(face_landmarks)
+            if pts.ndim == 2 and pts.shape[0] > 0:
+                if pts.shape[1] == 2:
+                    rr.log("pose/face_landmarks", rr.Points2D(pts, colors=[[255, 255, 0]]))
+                elif pts.shape[1] >= 3:
+                    rr.log("pose/face_landmarks", rr.Points3D(pts[:, :3], colors=[[255, 255, 0]]))
+
     def _render_camera(self, data: dict):
         """Render camera data."""
         self._log_data("camera", data)

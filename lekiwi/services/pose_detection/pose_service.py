@@ -14,6 +14,7 @@ import mediapipe as mp
 
 # Assuming these are available from your common service files
 from ..base import ServiceBase, Priority, ServiceEvent
+from ...vision import FrameRingBuffer, compute_quality_metrics
 
 
 @dataclass
@@ -130,6 +131,8 @@ class PoseDetectionService(ServiceBase):
         self.detector = detector
         self.status_callback = status_callback  # The function to call back to LeKiwi
         self.visualizer = visualizer
+        self.ring_buffer = FrameRingBuffer(max_seconds=10.0, maxlen=300)
+        self._prev_gray = None
 
         # State and configuration
         self.prev_is_fall_state = False  # Replaces self.prev_state
@@ -153,6 +156,14 @@ class PoseDetectionService(ServiceBase):
         return cv2.resize(
             frame, (self.target_width, new_h), interpolation=cv2.INTER_AREA
         )
+
+    def _resize_for_buffer(self, frame, target_width: int = 320):
+        h, w, _ = frame.shape
+        if w <= target_width:
+            return frame
+        scale = target_width / float(w)
+        new_h = int(h * scale)
+        return cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
     # 1. Override start() to initialize resources
     def start(self):
@@ -184,6 +195,8 @@ class PoseDetectionService(ServiceBase):
         self._frame_idx = 0
         self._last_fall_event: Optional[FallEvent] = None
         self._last_is_fall = False
+        self.ring_buffer.clear()
+        self._prev_gray = None
 
         while self._running.is_set():
             # --- Check for Inbound Control Events (using ServiceBase logic) ---
@@ -225,8 +238,15 @@ class PoseDetectionService(ServiceBase):
             if process_this:
                 infer_frame = self._resize_for_infer(frame)
                 result = self.pose.infer(infer_frame)
-                if result.pose_landmarks:
-                    event = self.detector.detect(result.pose_landmarks.landmark)
+                landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
+                quality = compute_quality_metrics(
+                    frame, self._prev_gray, landmarks, downscale_width=self.target_width or 320
+                )
+                gray = quality.pop("gray", None)
+                self._prev_gray = gray
+
+                if landmarks:
+                    event = self.detector.detect(landmarks)
                     if event:
                         is_fall = event.is_fall
                         # --- Event Emission Logic ---
@@ -236,6 +256,7 @@ class PoseDetectionService(ServiceBase):
                                 "score": event.score,
                                 "ratio": event.ratio,
                                 "timestamp": event.timestamp,
+                                "quality": quality,
                             }
                             event_type = "PERSON_FALLEN" if is_fall else "PERSON_STABLE"
                             self.status_callback(event_type, event_data)
@@ -247,6 +268,18 @@ class PoseDetectionService(ServiceBase):
                     self.prev_is_fall_state = False  # No pose detected
                 self._last_fall_event = event or self._last_fall_event
                 self._last_is_fall = is_fall
+
+                # Record in ring buffer (downscaled to save memory)
+                try:
+                    buf_frame = self._resize_for_buffer(frame)
+                    self.ring_buffer.add(
+                        buf_frame,
+                        landmarks,
+                        quality,
+                        ts=event.timestamp if event else time.time(),
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Ring buffer add failed: {e}")
 
             now = time.time()
             fps = 1.0 / max(now - self._prev_time, 1e-6)
