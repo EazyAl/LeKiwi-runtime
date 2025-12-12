@@ -38,9 +38,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Turn off LeKiwi robot motors and disconnect"
     )
-    parser.add_argument("--id", type=str, required=True, help="ID of the robot")
     parser.add_argument(
-        "--port", type=str, required=True, help="Serial port for the robot"
+        "--id", type=str, default="biden_kiwi", help="ID of the robot"
+    )
+    parser.add_argument(
+        "--port", type=str, default="/dev/ttyACM0", help="Serial port for the robot"
     )
     args = parser.parse_args()
 
@@ -48,4 +50,6 @@ def main():
 
 
 if __name__ == "__main__":
+    print("Turning off robot...")
+
     main()
