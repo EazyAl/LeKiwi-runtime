@@ -1,0 +1,152 @@
+{
+  "id": "help",
+  "name": "Emergency Help Workflow",
+  "description": "Emergency response workflow for checking on the user, administering epipen and coordinating with 911",
+  "author": "team",
+  "createdAt": "2025-01-15T00:00:00Z",
+  "state_schema": {
+    "user_is_okay": { "type": "boolean", "default": false },
+    "emergency_mode": { "type": "boolean", "default": false },
+    "call_911_success": { "type": "boolean", "default": false },
+    "operator_says_administer": { "type": "boolean", "default": false },
+    "epipen_administered": { "type": "boolean", "default": false },
+    "user_confirmed_okay": { "type": "boolean", "default": false },
+    "team_coming": { "type": "boolean", "default": false }
+  },
+  "nodes": [
+    {
+      "id": "navigate_to_epipen",
+      "intent": "Navigate to the epipen administration point. Move to the location where the epipen is stored. IMPORTANT: Only call navigate_to_epipen_location() - do NOT call 911 or update any state variables yet. After navigation is complete, call complete_step() with NO state updates (empty dict or null).",
+      "preferred_actions": ["navigate_to_epipen_location"]
+    },
+    {
+      "id": "ask_if_okay",
+      "intent": "Ask the person if they are okay. Check on their condition and wait for their response. IMPORTANT: After getting their response, call complete_step() with state_updates containing ONLY 'user_is_okay' set to true (if they say they're fine) or false (if they say no or don't respond). Do NOT update any other state variables.",
+      "preferred_actions": []
+    },
+    {
+      "id": "revert_to_normal",
+      "intent": "The person says they are fine. Revert to normal operational state and exit the emergency workflow. Call toggle_state('normal') to switch back to normal mode, then call complete_step() with NO state updates to end the workflow.",
+      "preferred_actions": ["toggle_state"]
+    },
+    {
+      "id": "call_911",
+      "intent": "The person says they are not okay or did not respond. Call 911 emergency services and switch to emergency mode. IMPORTANT: First call call_911_emergency(), then call toggle_state('emergency'). After both are done, call complete_step() with state_updates containing ONLY 'call_911_success' set to true (if call succeeded) or false (if call failed). Do NOT update operator_says_administer or any other state variables here.",
+      "preferred_actions": ["call_911_emergency", "toggle_state"]
+    },
+    {
+      "id": "administer_epipen_fallback",
+      "intent": "The 911 call failed. Administer the epipen immediately as a fallback measure. Call administer_epipen(), then call complete_step() with NO state updates to end the workflow (you remain in emergency mode).",
+      "preferred_actions": ["administer_epipen"]
+    },
+    {
+      "id": "communicate_with_911",
+      "intent": "The 911 call succeeded. Communicate with the 911 operator and describe the current state of the person in detail. IMPORTANT: After communicating with the operator and getting their instructions, call complete_step() with state_updates containing ONLY 'operator_says_administer' set to true (if they tell you to administer epipen) or false (if they say team is coming or don't say to administer). Do NOT update any other state variables here.",
+      "preferred_actions": []
+    },
+    {
+      "id": "administer_epipen_on_instruction",
+      "intent": "The 911 operator has instructed you to administer the epipen. Do so immediately. Call administer_epipen(), then call complete_step() with state_updates containing ONLY 'epipen_administered' set to true. Do NOT update user_confirmed_okay yet.",
+      "preferred_actions": ["administer_epipen"]
+    },
+    {
+      "id": "confirm_user_okay",
+      "intent": "After administering the epipen, confirm that the user is okay. Check their condition and ask if they feel better. IMPORTANT: After getting their response, call complete_step() with state_updates containing ONLY 'user_confirmed_okay' set to true (if they say they're okay) or false (if they're still not okay). Do NOT update any other state variables.",
+      "preferred_actions": []
+    },
+    {
+      "id": "exit_to_normal",
+      "intent": "The user confirmed they are okay after epipen administration. Exit the emergency workflow and switch back to normal operational mode. Call toggle_state('normal'), then call complete_step() with NO state updates to end the workflow.",
+      "preferred_actions": ["toggle_state"]
+    },
+    {
+      "id": "inform_patient_waiting",
+      "intent": "Inform the patient that the emergency team is coming. Stay put and provide reassurance while waiting for help. Call complete_step() with NO state updates to end the workflow (you remain in emergency mode).",
+      "preferred_actions": []
+    }
+  ],
+  "edges": [
+    {
+      "id": "start",
+      "source": "START",
+      "target": "navigate_to_epipen",
+      "type": "normal"
+    },
+    {
+      "id": "e1",
+      "source": "navigate_to_epipen",
+      "target": "ask_if_okay",
+      "type": "normal"
+    },
+    {
+      "id": "e2",
+      "source": "ask_if_okay",
+      "target": {
+        "true": "revert_to_normal",
+        "false": "call_911"
+      },
+      "state_key": "user_is_okay",
+      "type": "condition"
+    },
+    {
+      "id": "e3",
+      "source": "revert_to_normal",
+      "target": "END",
+      "type": "normal"
+    },
+    {
+      "id": "e4",
+      "source": "call_911",
+      "target": {
+        "true": "communicate_with_911",
+        "false": "administer_epipen_fallback"
+      },
+      "state_key": "call_911_success",
+      "type": "condition"
+    },
+    {
+      "id": "e5",
+      "source": "administer_epipen_fallback",
+      "target": "END",
+      "type": "normal"
+    },
+    {
+      "id": "e6",
+      "source": "communicate_with_911",
+      "target": {
+        "true": "administer_epipen_on_instruction",
+        "false": "inform_patient_waiting"
+      },
+      "state_key": "operator_says_administer",
+      "type": "condition"
+    },
+    {
+      "id": "e7",
+      "source": "administer_epipen_on_instruction",
+      "target": "confirm_user_okay",
+      "type": "normal"
+    },
+    {
+      "id": "e8",
+      "source": "confirm_user_okay",
+      "target": {
+        "true": "exit_to_normal",
+        "false": "inform_patient_waiting"
+      },
+      "state_key": "user_confirmed_okay",
+      "type": "condition"
+    },
+    {
+      "id": "e9",
+      "source": "exit_to_normal",
+      "target": "END",
+      "type": "normal"
+    },
+    {
+      "id": "e10",
+      "source": "inform_patient_waiting",
+      "target": "END",
+      "type": "normal"
+    }
+  ]
+}
