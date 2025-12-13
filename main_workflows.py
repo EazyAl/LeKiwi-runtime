@@ -1,8 +1,6 @@
 import os
-import sys
 
 import logging
-import asyncio
 from pathlib import Path
 import time
 from typing import Optional, Dict, Any, TYPE_CHECKING
@@ -11,25 +9,6 @@ if TYPE_CHECKING:
     from livekit.agents import AgentSession
 
 from dotenv import load_dotenv
-
-# ---- Logging configuration ----
-# Many dependencies (draccus, gitpython, livekit) can be extremely chatty at DEBUG.
-# Configure logging once, early, and allow override via LOG_LEVEL env var.
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=_LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    force=True,  # override any handlers configured by imported libs
-)
-# Silence especially noisy loggers by default.
-for _name, _lvl in {
-    "draccus": logging.WARNING,
-    "git": logging.WARNING,
-    "git.cmd": logging.WARNING,
-    "asyncio": logging.INFO,
-    "lekiwi.workflows.workflows": logging.INFO,
-}.items():
-    logging.getLogger(_name).setLevel(_lvl)
 
 logger = logging.getLogger(__name__)
 from livekit import rtc, agents

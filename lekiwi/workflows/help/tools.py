@@ -56,8 +56,7 @@ async def navigate_to_administration_point(self) -> str:
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
-    logger.debug("LeKiwi: navigate_to_epipen_location function called")
-    # TODO: Implement actual navigation logic
+    await self.navigator.navigate_to_epipen_location()
     return "Navigated to epipen administration point"
 
 
@@ -265,7 +264,6 @@ async def navigate_to_person(self) -> str:
 async def administer_epipen(self) -> str:
     """
     Administer the epipen to the person in need using advanced VLA control.
-    Uses π₀.₅ vision-language-action model for precise epipen administration.
     This blocks until the epipen administration is complete.
 
     Returns:
@@ -274,8 +272,6 @@ async def administer_epipen(self) -> str:
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
-
-    logger.debug("LeKiwi: administer_epipen function called")
 
     # Check if service is ready
     if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
