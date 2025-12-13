@@ -4,9 +4,7 @@ Navigation module for LeKiwi robot - handles person detection, alignment, and ap
 
 import cv2
 import time
-import torch
 import numpy as np
-import mediapipe as mp
 
 # LeKiwi imports
 from lekiwi.services.pose_detection.pose_service import PoseEstimator

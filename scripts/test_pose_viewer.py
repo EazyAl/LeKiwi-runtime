@@ -22,7 +22,9 @@ from lekiwi.vision import (
 )
 
 
-def draw_overlay(frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict) -> bool:
+def draw_overlay(
+    frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict
+) -> bool:
     """Custom viewer with larger text overlays."""
     label = "FALL" if is_fall else "OK"
     color = (0, 0, 255) if is_fall else (0, 200, 0)
@@ -121,7 +123,7 @@ def draw_overlay(frame, result, event, is_fall: bool, fps: float, quality: dict,
 
 
 def main():
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     pose = PoseEstimator()
@@ -142,9 +144,13 @@ def main():
             break
 
         result = pose.infer(frame)
-        landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
+        landmarks = (
+            result.pose_landmarks.landmark if result and result.pose_landmarks else None
+        )
 
-        quality = compute_quality_metrics(frame, prev_gray, landmarks, downscale_width=320)
+        quality = compute_quality_metrics(
+            frame, prev_gray, landmarks, downscale_width=320
+        )
         prev_gray = quality.pop("gray", None)
 
         event = None
@@ -161,8 +167,8 @@ def main():
         last_time = now
 
         face_stats = {
-            'face_status': 'no_face',
-            'hr_method': '',
+            "face_status": "no_face",
+            "hr_method": "",
         }
         face_result = face_lm.infer(frame)
         if face_result.multi_face_landmarks:
@@ -183,7 +189,9 @@ def main():
                 "hr_method": hr.get("method", ""),
             }
 
-        stop = draw_overlay(frame, result, event or last_event, is_fall, fps, quality, face_stats)
+        stop = draw_overlay(
+            frame, result, event or last_event, is_fall, fps, quality, face_stats
+        )
         if stop:
             break
 
