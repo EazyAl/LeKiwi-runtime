@@ -255,11 +255,16 @@ class WorkflowService:
                             # But original_func expects self as first arg, so we need to handle that
                             @functools.wraps(unwrapped_func)
                             async def tool_method(
-                                self_instance: Any, *args: Any, **kwargs: Any
+                                self_instance: Any,
+                                *args: Any,
+                                __tool_func: Any = unwrapped_func,
+                                **kwargs: Any,
                             ) -> Any:
                                 # Call the original function with self_instance as self
                                 # Note: self_instance is the agent instance passed by LiveKit
-                                result = unwrapped_func(self_instance, *args, **kwargs)
+                                # CRITICAL: bind the current tool function via default arg to avoid late-binding
+                                # closure bugs when defining this wrapper inside a loop.
+                                result = __tool_func(self_instance, *args, **kwargs)
                                 # Ensure we await if it's a coroutine
                                 if inspect.iscoroutine(result):
                                     return await result

@@ -484,6 +484,12 @@ async def entrypoint(ctx: agents.JobContext):
 
     session = AgentSession(llm=openai.realtime.RealtimeModel(voice="verse"))
 
+    # Make room/session info available to tools that need to target the active room
+    agent.current_room_name = getattr(ctx, "room", None) and getattr(
+        ctx.room, "name", None
+    )
+    agent._agent_session = session
+
     await session.start(
         room=ctx.room,
         agent=agent,

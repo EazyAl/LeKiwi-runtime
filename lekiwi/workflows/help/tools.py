@@ -1,11 +1,29 @@
+import asyncio
+import base64
+import json
 import logging
+import os
+import urllib.error
+import urllib.request
 
 from livekit.agents import function_tool
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_DEMO_NUMBER = os.getenv("DEMO_EMERGENCY_NUMBER", "+33753823988")
+
 # Workflow-specific tools for the help/emergency workflow
 # These are dummy implementations - actual implementations will be added later
+
+
+def _mask_phone_number(num: str | None) -> str:
+    """Mask a phone number for logs (avoid leaking full destination)."""
+    if not num:
+        return "<none>"
+    s = str(num)
+    if len(s) <= 4:
+        return "****"
+    return f"{s[:-4]}****"
 
 
 def _guard_emergency_only(agent) -> str | None:
@@ -54,11 +72,157 @@ async def call_911_emergency(self) -> str:
     """
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
+        logger.info(
+            "LeKiwi: call_911_emergency blocked by guard (operational_mode=%s)",
+            getattr(self, "operational_mode", "normal"),
+        )
         return guard_msg
     logger.debug("LeKiwi: call_911_emergency function called")
-    # TODO: Implement actual 911 calling logic
-    # This should return success/failure status
-    return "911 emergency call initiated"
+
+    # Hard allowlist to prevent real emergency dialing
+    destination = ALLOWED_DEMO_NUMBER
+    if destination != "+33753823988" and os.getenv("DEMO_EMERGENCY_NUMBER") is None:
+        # If someone changed the default without setting the env, refuse
+        logger.warning(
+            "LeKiwi: call_911_emergency blocked by allowlist (destination=%s, env_set=%s)",
+            _mask_phone_number(destination),
+            False,
+        )
+        return (
+            "Blocked: destination number not allowlisted. "
+            "Set DEMO_EMERGENCY_NUMBER to the approved demo target."
+        )
+
+    livekit_url = os.getenv("LIVEKIT_URL")
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+    sip_trunk_id = os.getenv("LIVEKIT_SIP_TRUNK_ID")
+    missing = [
+        name
+        for name, val in [
+            ("LIVEKIT_URL", livekit_url),
+            ("LIVEKIT_API_KEY", api_key),
+            ("LIVEKIT_API_SECRET", api_secret),
+            ("LIVEKIT_SIP_TRUNK_ID", sip_trunk_id),
+        ]
+        if not val
+    ]
+    if missing:
+        logger.error(
+            "LeKiwi: call_911_emergency missing required env vars: %s",
+            ", ".join(missing),
+        )
+        return f"Missing required env vars for SIP call: {', '.join(missing)}"
+    # Type narrowing for static checkers (os.getenv returns Optional[str])
+    assert livekit_url and api_key and api_secret and sip_trunk_id
+
+    room_name = getattr(self, "current_room_name", None)
+    if not room_name:
+        room_name = "emergency-help-room"
+        logger.warning(
+            "LeKiwi: current_room_name was not set; using fallback room '%s'", room_name
+        )
+
+    payload = {
+        "sip_trunk_id": sip_trunk_id,
+        "sip_call_to": destination,
+        "room_name": room_name,
+        "participant_identity": "sip-operator",
+        "participant_name": "Demo 911",
+        "wait_until_answered": True,
+    }
+
+    logger.info(
+        "LeKiwi: initiating demo emergency SIP call (destination=%s, room=%s, trunk_set=%s, livekit_base=%s)",
+        _mask_phone_number(destination),
+        room_name,
+        bool(sip_trunk_id),
+        _normalize_base_url(livekit_url),
+    )
+
+    ok, result = await _create_sip_participant(
+        base_url=_normalize_base_url(livekit_url),
+        api_key=api_key,
+        api_secret=api_secret,
+        payload=payload,
+    )
+    if ok:
+        logger.debug("LeKiwi: SIP participant created: %s", result)
+        return "911 emergency call initiated (demo number), waiting for operator."
+    else:
+        logger.error("LeKiwi: failed to create SIP participant: %s", result)
+        return f"Failed to initiate emergency call: {result}"
+
+
+def _normalize_base_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    base = raw.rstrip("/")
+    if base.startswith("wss://"):
+        base = "https://" + base[len("wss://") :]
+    elif base.startswith("ws://"):
+        base = "http://" + base[len("ws://") :]
+    return base
+
+
+async def _create_sip_participant(
+    base_url: str | None, api_key: str, api_secret: str, payload: dict
+) -> tuple[bool, str | dict]:
+    if not base_url:
+        return False, "LIVEKIT_URL is not set or invalid"
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _create_sip_participant_sync, base_url, api_key, api_secret, payload
+    )
+
+
+def _create_sip_participant_sync(
+    base_url: str, api_key: str, api_secret: str, payload: dict
+) -> tuple[bool, str | dict]:
+    url = f"{base_url}/twirp/livekit.SIP/CreateSIPParticipant"
+    data = json.dumps(payload).encode("utf-8")
+    auth = base64.b64encode(f"{api_key}:{api_secret}".encode("utf-8")).decode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {auth}",
+    }
+    safe_payload = dict(payload)
+    if "sip_call_to" in safe_payload:
+        safe_payload["sip_call_to"] = _mask_phone_number(
+            str(safe_payload["sip_call_to"])
+        )
+    logger.debug(
+        "LeKiwi: SIP CreateSIPParticipant POST %s payload=%s", url, safe_payload
+    )
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            try:
+                parsed = json.loads(body)
+                logger.info(
+                    "LeKiwi: SIP CreateSIPParticipant succeeded (http=%s)",
+                    getattr(resp, "status", "unknown"),
+                )
+                return True, parsed
+            except json.JSONDecodeError:
+                logger.warning(
+                    "LeKiwi: SIP CreateSIPParticipant returned non-JSON body (len=%s)",
+                    len(body),
+                )
+                return True, {"raw": body}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        logger.error(
+            "LeKiwi: SIP CreateSIPParticipant HTTPError (http=%s, body_len=%s)",
+            e.code,
+            len(error_body),
+        )
+        return False, f"HTTP {e.code}: {error_body}"
+    except Exception as e:  # pragma: no cover - network/transport errors
+        logger.exception("LeKiwi: SIP CreateSIPParticipant transport error")
+        return False, str(e)
 
 
 @function_tool
