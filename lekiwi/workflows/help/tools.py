@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 ALLOWED_DEMO_NUMBER = os.getenv("DEMO_EMERGENCY_NUMBER", "+33753823988")
 
 # Workflow-specific tools for the help/emergency workflow
-# These are dummy implementations - actual implementations will be added later
 
 
+# TODO(ALI): not needed if you replace it
 def _mask_phone_number(num: str | None) -> str:
     """Mask a phone number for logs (avoid leaking full destination)."""
     if not num:
@@ -45,13 +45,13 @@ def _guard_emergency_only(agent) -> str | None:
 
 
 @function_tool
-async def navigate_to_epipen_location(self) -> str:
+async def navigate_to_administration_point(self) -> str:
     """
     Navigate to the epipen administration point. Move the robot to the location
     where the epipen is stored so it can be administered.
 
     Returns:
-        Confirmation message indicating successful navigation to epipen location.
+        Confirmation message indicating successful navigation to administration point.
     """
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
@@ -61,8 +61,9 @@ async def navigate_to_epipen_location(self) -> str:
     return "Navigated to epipen administration point"
 
 
+# TODO(ALI): replace with working ER call
 @function_tool
-async def call_911_emergency(self) -> str:
+async def call_emergency_services(self) -> str:
     """
     Call 911 emergency services. This initiates contact with emergency responders.
     The function should return success status which will be stored in call_911_success state.
@@ -154,6 +155,7 @@ async def call_911_emergency(self) -> str:
         return f"Failed to initiate emergency call: {result}"
 
 
+# TODO(ALI): not needed if you replace it
 def _normalize_base_url(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -165,6 +167,7 @@ def _normalize_base_url(raw: str | None) -> str | None:
     return base
 
 
+# TODO(ALI): not needed if you replace it
 async def _create_sip_participant(
     base_url: str | None, api_key: str, api_secret: str, payload: dict
 ) -> tuple[bool, str | dict]:
@@ -177,6 +180,7 @@ async def _create_sip_participant(
     )
 
 
+# TODO(ALI): not needed if you replace it
 def _create_sip_participant_sync(
     base_url: str, api_key: str, api_secret: str, payload: dict
 ) -> tuple[bool, str | dict]:
@@ -226,17 +230,63 @@ def _create_sip_participant_sync(
 
 
 @function_tool
-async def administer_epipen(self) -> str:
+async def navigate_to_person(self) -> str:
     """
-    Administer the epipen to the person in need. This is a critical emergency action
-    that should be performed when instructed by 911 operator or as a fallback if 911 call fails.
+    Navigate to a person using computer vision. This will:
+    1. Locate the person using pose detection
+    2. Rotate to their thigh for proper orientation
+    3. Drive forward to an appropriate interaction distance
+    4. Block until the complete sequence finishes
+
+    This is used during emergency situations to position the robot
+    correctly relative to a person requiring assistance.
 
     Returns:
-        Confirmation message indicating successful epipen administration.
+        Confirmation message indicating navigation success or failure reason.
     """
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
+
+    logger.debug("LeKiwi: navigate_to_person function called")
+
+    # Run navigation synchronously - blocks main thread until complete
+    try:
+        result = self.navigator.navigate_to_person()
+        logger.info(f"LeKiwi: navigate_to_person completed with result: {result}")
+        return result
+    except Exception as e:
+        error_msg = f"Navigation failed: {str(e)}"
+        logger.error(f"LeKiwi: navigate_to_person failed: {error_msg}")
+        return error_msg
+
+
+@function_tool
+async def administer_epipen(self) -> str:
+    """
+    Administer the epipen to the person in need using advanced VLA control.
+    Uses π₀.₅ vision-language-action model for precise epipen administration.
+    This blocks until the epipen administration is complete.
+
+    Returns:
+        Confirmation message indicating successful epipen administration or failure reason.
+    """
+    guard_msg = _guard_emergency_only(self)
+    if guard_msg is not None:
+        return guard_msg
+
     logger.debug("LeKiwi: administer_epipen function called")
-    # TODO: Implement actual epipen administration logic
-    return "Epipen administered successfully"
+
+    # Check if service is ready
+    if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
+        return "Error: Epipen service not available. Check π₀.₅ installation."
+
+    # Execute synchronous epipen administration
+    try:
+        result = self.epipen_service.administer_epipen()
+        logger.info(f"LeKiwi: administer_epipen completed with result: {result}")
+        return result
+    except Exception as e:
+        error_msg = f"Epipen administration failed: {str(e)}"
+        logger.error(f"LeKiwi: administer_epipen error: {error_msg}")
+        return error_msg
