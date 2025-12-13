@@ -1,20 +1,25 @@
 """
-Epipen administration service using ACT policy for precise medical procedure execution.
+Epipen administration service using PI0.5 policy for precise medical procedure execution.
+Uses lerobot's official preprocessor/postprocessor pipeline for proper normalization.
 """
 
 import time
 import logging
 from typing import Optional
+import torch
 from lekiwi.robot.lekiwi import LeKiwi
 
-# ACT policy imports (based on user's policy path)
+# lerobot imports for policy inference with proper normalization
 try:
-    from lerobot.policies.act.modeling_act import ACTPolicy
+    from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.utils import build_inference_frame, make_robot_action
+    from lerobot.datasets.utils import hw_to_dataset_features
 
-    ACT_AVAILABLE = True
-except ImportError:
-    ACT_AVAILABLE = False
-    logging.warning("ACT policy not available. Install with: pip install -e '.[act]'")
+    LEROBOT_AVAILABLE = True
+except ImportError as e:
+    LEROBOT_AVAILABLE = False
+    logging.warning(f"lerobot not available: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +29,12 @@ class EpipenService:
     Synchronous epipen administration service using ACT policy.
 
     Handles the complete epipen administration sequence with precise control.
+    Uses lerobot's official preprocessor/postprocessor for proper normalization.
     Designed to be called synchronously from workflow tools.
     """
 
     def __init__(
-        self, robot: LeKiwi, policy_path: str = "CRPlab/lekiwi_test_act_policy_2"
+        self, robot: LeKiwi, policy_path: str = "CRPlab/lekiwi_full_pi05_policy_1"
     ):
         """
         Initialize epipen service with robot and ACT policy.
@@ -38,36 +44,60 @@ class EpipenService:
             policy_path: Path to ACT policy (default: CRPlab/lekiwi_test_act_policy_2)
         """
         self.robot = robot
+        self.policy = None
+        self.preprocess = None
+        self.postprocess = None
+        self.dataset_features = None
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
-        if not ACT_AVAILABLE:
-            logger.error("ACT policy not available. Cannot initialize EpipenService.")
-            self.policy = None
+        if not LEROBOT_AVAILABLE:
+            logger.error("lerobot not available. Cannot initialize EpipenService.")
         else:
             try:
-                logger.info(f"Loading ACT policy from {policy_path}")
-                self.policy = ACTPolicy.from_pretrained(policy_path)
-                logger.info("ACT policy loaded successfully")
+                logger.info(f"Loading PI0 policy from {policy_path}")
+                self.policy = PI0Policy.from_pretrained(policy_path)
+                self.policy.eval()
+                
+                # Create preprocessor and postprocessor for proper normalization
+                self.preprocess, self.postprocess = make_pre_post_processors(
+                    self.policy.config,
+                    policy_path,
+                    preprocessor_overrides={"device_processor": {"device": str(self.device)}},
+                )
+                
+                # Build dataset features from robot's observation/action features
+                # Filter out base velocity keys - policy was trained with arm only (6 state values)
+                arm_action_features = {k: v for k, v in robot.action_features.items() 
+                                       if k not in ["x.vel", "y.vel", "theta.vel"]}
+                arm_obs_features = {k: v for k, v in robot.observation_features.items() 
+                                    if k not in ["x.vel", "y.vel", "theta.vel"]}
+                
+                action_features = hw_to_dataset_features(arm_action_features, "action")
+                obs_features = hw_to_dataset_features(arm_obs_features, "observation")
+                self.dataset_features = {**action_features, **obs_features}
+                
+                logger.info(f"PI0 policy loaded successfully on device: {self.device}")
             except Exception as e:
-                logger.error(f"Failed to load ACT policy: {e}")
-                self.policy = None
+                logger.error(f"Failed to load PI0 policy: {e}")
+                import traceback
+                traceback.print_exc()
 
-        # Task description for ACT model
-        self._task_description = (
-            "Administer epipen to person in medical emergency. "
-            "Carefully approach the person, locate the epipen, "
-            "and administer it safely to the thigh area."
-        )
+        # Task description matching the training data
+        self._task_description = "pick up object and stab object"
+        
+        # Robot type for multi-embodiment support
+        self._robot_type = "lekiwi"
 
         # Control parameters
         self.max_administration_time = 60  # Maximum 60 seconds for safety
-        self.inference_fps = 10  # Adjust based on hardware
+        self.inference_fps = 30  # Match dataset fps
 
     def administer_epipen(self) -> str:
         """
         Execute complete epipen administration sequence using VLA control.
 
         This method BLOCKS until administration is complete, fails, or times out.
-        Designed for synchronous workflow execution.
+        Uses lerobot's preprocessor/postprocessor for proper normalization.
 
         Returns:
             str: Success message or failure reason
@@ -94,16 +124,38 @@ class EpipenService:
 
                 try:
                     # Get current observation from robot
-                    observation = self.robot.get_observation()
+                    raw_obs = self.robot.get_observation()
+                    
+                    # Filter observation to only include arm state (policy trained with 6 arm values, not 9)
+                    # Remove base velocity keys that aren't in the training data
+                    filtered_obs = {k: v for k, v in raw_obs.items() 
+                                   if k not in ["x.vel", "y.vel", "theta.vel"]}
+                    
+                    # Build inference frame using lerobot's utility
+                    # Signature: build_inference_frame(observation, device, ds_features, task, robot_type)
+                    obs_frame = build_inference_frame(
+                        filtered_obs, 
+                        self.device,
+                        self.dataset_features, 
+                        task=self._task_description,
+                        robot_type=self._robot_type,
+                    )
+                    
+                    # Preprocess observation (normalizes inputs)
+                    obs = self.preprocess(obs_frame)
 
                     # Predict actions using ACT policy
-                    action_tensor = self.policy.select_action(observation)
-
-                    # Convert tensor to dict format expected by LeKiwi robot
-                    action_dict = self._tensor_to_action_dict(action_tensor)
-
-                    # Execute actions on robot
-                    self.robot.send_action(action_dict)
+                    with torch.inference_mode():
+                        action = self.policy.select_action(obs)
+                    
+                    # Postprocess action (unnormalizes outputs)
+                    action = self.postprocess(action)
+                    
+                    # Convert to robot action format
+                    action_dict = make_robot_action(action, self.dataset_features)
+                    
+                    # Execute actions on robot (arm only since policy was trained on arm)
+                    self.robot.send_arm_action(action_dict)
 
                     # Check if administration is complete
                     if self._is_epipen_administration_complete():
@@ -116,6 +168,8 @@ class EpipenService:
                 except Exception as e:
                     error_msg = f"VLA inference/execution error: {str(e)}"
                     logger.error(error_msg)
+                    import traceback
+                    traceback.print_exc()
                     return error_msg
 
             # Timeout reached
@@ -129,40 +183,6 @@ class EpipenService:
             logger.error(error_msg)
             print(error_msg)
             return error_msg
-
-    def _tensor_to_action_dict(self, action_tensor) -> dict:
-        """
-        Convert ACT policy tensor output to LeKiwi robot action dict format.
-
-        Args:
-            action_tensor: Tensor output from ACT policy
-
-        Returns:
-            dict: Action dict in LeKiwi format
-        """
-        # Convert tensor to numpy and flatten
-        action_values = action_tensor.detach().cpu().numpy().flatten()
-
-        # LeKiwi action features in expected order
-        action_keys = [
-            "arm_shoulder_pan.pos",
-            "arm_shoulder_lift.pos",
-            "arm_elbow_flex.pos",
-            "arm_wrist_flex.pos",
-            "arm_wrist_roll.pos",
-            "arm_gripper.pos",
-            "x.vel",
-            "y.vel",
-            "theta.vel",
-        ]
-
-        # Create action dict
-        action_dict = {}
-        for i, key in enumerate(action_keys):
-            if i < len(action_values):
-                action_dict[key] = float(action_values[i])
-
-        return action_dict
 
     def _is_epipen_administration_complete(self) -> bool:
         """

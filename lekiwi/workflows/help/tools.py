@@ -288,6 +288,10 @@ async def administer_epipen(self) -> str:
     if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
         return "Error: Epipen service not available. Check π₀.₅ installation."
 
+    # Pause arms service to prevent conflicting motor commands during ACT policy execution
+    if hasattr(self, "arms_service"):
+        self.arms_service.pause()
+
     # Execute synchronous epipen administration
     try:
         result = self.epipen_service.administer_epipen()
@@ -297,3 +301,7 @@ async def administer_epipen(self) -> str:
         error_msg = f"Epipen administration failed: {str(e)}"
         logger.error(f"LeKiwi: administer_epipen error: {error_msg}")
         return error_msg
+    finally:
+        # Always resume arms service after epipen administration (success or failure)
+        if hasattr(self, "arms_service"):
+            self.arms_service.resume()

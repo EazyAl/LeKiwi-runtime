@@ -82,7 +82,7 @@ class LeTars(Agent):
 
         if status_type == "PERSON_FALLEN":
             # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            self.wheels_service.dispatch("play", "spin")
+            #administer the epipen
             # log it
             print(f"LeKiwi: Person fallen detected, dispatching spin action")
 
@@ -115,6 +115,31 @@ class LeTars(Agent):
         except Exception as e:
             result = f"Error getting recordings: {str(e)}"
             return result
+        
+    @function_tool
+    async def administer_epipen(self) -> str:
+        """
+        Administer the epipen to the person in need using advanced VLA control.
+        This blocks until the epipen administration is complete.
+
+        Returns:
+            Confirmation message indicating successful epipen administration or failure reason.
+        """
+
+
+        # Check if service is ready
+        if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
+            return "Error: Epipen service not available. Check π₀.₅ installation."
+
+        # Execute synchronous epipen administration
+        try:
+            result = self.epipen_service.administer_epipen()
+            logger.info(f"LeKiwi: administer_epipen completed with result: {result}")
+            return result
+        except Exception as e:
+            error_msg = f"Epipen administration failed: {str(e)}"
+            logger.error(f"LeKiwi: administer_epipen error: {error_msg}")
+            return error_msg
 
     @function_tool
     async def play_recording(self, recording_name: str) -> str:

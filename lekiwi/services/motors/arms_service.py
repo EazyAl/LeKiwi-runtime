@@ -57,6 +57,7 @@ class ArmsService:
 
         # Custom event handling
         self._running = threading.Event()
+        self._paused = threading.Event()  # For temporarily pausing playback
         self._event_queue = []
         self._event_lock = threading.Lock()
         self._event_thread: Optional[threading.Thread] = None
@@ -96,9 +97,24 @@ class ArmsService:
         with self._event_lock:
             self._event_queue.append((event_type, payload))
 
+    def pause(self):
+        """Pause arm playback temporarily (e.g., during epipen administration)"""
+        self._paused.set()
+        print("Arms service paused")
+
+    def resume(self):
+        """Resume arm playback after pause"""
+        self._paused.clear()
+        print("Arms service resumed")
+
     def _event_loop(self):
         """Custom event loop that supports interruption"""
         while self._running.is_set():
+            # Skip playback if paused (but still process events)
+            if self._paused.is_set():
+                time.sleep(0.05)  # Sleep while paused
+                continue
+
             # Check for events
             with self._event_lock:
                 if self._event_queue:

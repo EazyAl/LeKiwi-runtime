@@ -8,6 +8,16 @@ from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
 
+# Disable tokenizers parallelism to avoid fork warnings with PI0 policy
+# Must be set before any HuggingFace imports
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Suppress verbose DEBUG logging from lerobot cameras and robot before any imports
+# Must be done early before the loggers are created
+logging.getLogger("lerobot.cameras.opencv.camera_opencv").setLevel(logging.WARNING)
+logging.getLogger("lerobot.cameras").setLevel(logging.WARNING)
+logging.getLogger("lekiwi.robot.lekiwi").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 from livekit import rtc, agents
 from livekit.agents import (
@@ -113,19 +123,28 @@ class LeTars(Agent):
         self._pending_llm_lock = threading.Lock()
 
         # Initialize single shared robot connection
-        self.robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
+        from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+        self.robot_config = LeKiwiConfig(
+            port=port,
+            id=robot_id,
+            cameras={
+                "front": OpenCVCameraConfig(index_or_path=0, width=1280, height=720, fps=30),
+                "wrist": OpenCVCameraConfig(index_or_path=1, width=1280, height=720, fps=30),
+            },
+        )
         self.robot = LeKiwi(self.robot_config)
         self.robot.connect(calibrate=False)
 
         # Lock to serialize access to robot motor commands (serial port is not thread-safe)
-        self.robot_lock = threading.Lock()
+        self.robot_lock = threading.Lock()  
 
         # Three services running on separate threads, with agent dispatching events to them
         # Pass shared robot instance and lock to avoid multiple connections and serial port conflicts
         self.wheels_service = WheelsService(
             robot=self.robot, robot_lock=self.robot_lock
         )
-        self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
+        #Commented out for testing. 
+        # self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
 
         # Pose service camera selection:
         # - Defaults to index 0
@@ -155,11 +174,11 @@ class LeTars(Agent):
 
         # Start robot services
         self.wheels_service.start()
-        self.arms_service.start()
+        # self.arms_service.start()
         self.pose_service.start()
 
         # Wake up animation
-        self.arms_service.dispatch("play", "wake_up")
+        # self.arms_service.dispatch("play", "wake_up")
 
     def _enqueue_or_send_llm_instructions(self, instructions: str) -> None:
         """
@@ -234,6 +253,7 @@ class LeTars(Agent):
                 self._enqueue_or_send_llm_instructions(
                     "PERSON_STABLE detected. Returning to normal mode."
                 )
+        
 
     @function_tool
     async def get_available_recordings(self) -> str:
@@ -249,8 +269,8 @@ class LeTars(Agent):
         """
         print("LeKiwi: get_available_recordings function called")
         try:
-            recordings = self.arms_service.get_available_recordings()
-            recordings += self.wheels_service.get_available_recordings()
+            # recordings = self.arms_service.get_available_recordings()
+            recordings = self.wheels_service.get_available_recordings()
 
             if recordings:
                 result = f"Available recordings: {', '.join(recordings)}"
@@ -281,7 +301,8 @@ class LeTars(Agent):
         try:
             # Send play event to animation service
             if type == "arms":
-                self.arms_service.dispatch("play", recording_name)
+                # self.arms_service.dispatch("play", recording_name)
+                return "Arms service is currently disabled"
             elif type == "wheels":
                 self.wheels_service.dispatch("play", recording_name)
             else:
@@ -291,6 +312,31 @@ class LeTars(Agent):
         except Exception as e:
             result = f"Error playing recording {recording_name}: {str(e)}"
             return result
+
+    @function_tool
+    async def administer_epipen(self) -> str:
+        """
+        Administer the epipen to the person in need using advanced VLA control.
+        This blocks until the epipen administration is complete.
+
+        Returns:
+            Confirmation message indicating successful epipen administration or failure reason.
+        """
+
+
+        # Check if service is ready
+        if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
+            return "Error: Epipen service not available. Check π₀.₅ installation."
+
+        # Execute synchronous epipen administration
+        try:
+            result = self.epipen_service.administer_epipen()
+            logger.info(f"LeKiwi: administer_epipen completed with result: {result}")
+            return result
+        except Exception as e:
+            error_msg = f"Epipen administration failed: {str(e)}"
+            logger.error(f"LeKiwi: administer_epipen error: {error_msg}")
+            return error_msg
 
     @function_tool
     async def get_configuration(self) -> str:

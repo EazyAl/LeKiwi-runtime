@@ -1,0 +1,70 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "lekiwi-full-dataset",
+  "dataset_size": 5597888,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/CRPlab/lekiwi-full-dataset@ffe8ad2b34deffc655c8eb5ea0a231b4f2945b6c/data/chunk-000/file-000.parquet": {
+      "num_bytes": 3337626,
+      "checksum": null
+    }
+  },
+  "download_size": 3337626,
+  "features": {
+    "action": {
+      "feature": {
+        "dtype": "float32",
+        "_type": "Value"
+      },
+      "length": 6,
+      "_type": "List"
+    },
+    "observation.state": {
+      "feature": {
+        "dtype": "float32",
+        "_type": "Value"
+      },
+      "length": 6,
+      "_type": "List"
+    },
+    "timestamp": {
+      "dtype": "float32",
+      "_type": "Value"
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "episode_index": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "index": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "task_index": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 8935514,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 5597888,
+      "num_examples": 64992,
+      "dataset_name": "lekiwi-full-dataset"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}
