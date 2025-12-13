@@ -4,6 +4,8 @@ Navigation module for LeKiwi robot - handles person detection, alignment, and ap
 
 import cv2
 import time
+import threading
+from typing import Optional
 import torch
 import numpy as np
 import mediapipe as mp
@@ -29,14 +31,16 @@ class Navigator:
     Designed to be called synchronously from workflow tools.
     """
 
-    def __init__(self, robot):
+    def __init__(self, robot, robot_lock: Optional[threading.Lock] = None):
         """
         Initialize navigator with robot instance.
 
         Args:
             robot: Connected LeKiwi robot instance
+            robot_lock: Optional lock to serialize robot motor access (for thread safety)
         """
         self.robot = robot
+        self.robot_lock = robot_lock if robot_lock is not None else threading.Lock()
 
         # Initialize components
         self.pose_estimator = PoseEstimator()
@@ -133,15 +137,16 @@ class Navigator:
                 rotation_speed = -rotation_angle * self.rotation_kp
                 rotation_speed = np.clip(rotation_speed, -20.0, 20.0)
 
-                # Send rotation command
+                # Send rotation command (with lock for thread safety)
                 try:
-                    self.robot.send_base_action(
-                        {
-                            "x.vel": 0.0,
-                            "y.vel": 0.0,
-                            "theta.vel": rotation_speed,
-                        }
-                    )
+                    with self.robot_lock:
+                        self.robot.send_base_action(
+                            {
+                                "x.vel": 0.0,
+                                "y.vel": 0.0,
+                                "theta.vel": rotation_speed,
+                            }
+                        )
                 except Exception as e:
                     print(f"Error sending rotation command: {e}")
                     return False
@@ -188,15 +193,16 @@ class Navigator:
                 print(".1f")
                 return True
 
-            # Continue driving forward
+            # Continue driving forward (with lock for thread safety)
             try:
-                self.robot.send_base_action(
-                    {
-                        "x.vel": self.drive_speed,
-                        "y.vel": 0.0,
-                        "theta.vel": 0.0,
-                    }
-                )
+                with self.robot_lock:
+                    self.robot.send_base_action(
+                        {
+                            "x.vel": self.drive_speed,
+                            "y.vel": 0.0,
+                            "theta.vel": 0.0,
+                        }
+                    )
             except Exception as e:
                 print(f"Error sending drive command: {e}")
                 return False

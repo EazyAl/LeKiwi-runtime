@@ -1,12 +1,10 @@
 import os
-
+import asyncio
+import threading
 import logging
 from pathlib import Path
 import time
-from typing import Optional, Dict, Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from livekit.agents import AgentSession
+from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -33,8 +31,7 @@ from lekiwi.services.motors.wheels_service import WheelsService
 from lekiwi.services.pose_detection.pose_service import (
     PoseDetectionService,
     CameraStream,
-    PoseEstimator,
-    FallDetector,
+    default_visualizer,
 )
 from lekiwi.workflows.workflows import WorkflowService
 from lekiwi.services.navigation import Navigator
@@ -42,6 +39,11 @@ from lekiwi.services.navigation import Navigator
 # import zmq
 
 load_dotenv()
+
+
+async def _generate_reply(session: AgentSession, instructions: str) -> None:
+    # Wrapper so we always pass a coroutine to run_coroutine_threadsafe().
+    await session.generate_reply(instructions=instructions)
 
 
 def _load_system_prompt() -> str:
@@ -100,26 +102,44 @@ class LeTars(Agent):
         stream_port: int = 5556,
     ):
         super().__init__(instructions=_load_system_prompt())
-        # Three services running on separate threads, with agent dispatching events to them
-        self.wheels_service = WheelsService(port=port, robot_id=robot_id)
-        self.arms_service = ArmsService(port=port, robot_id=robot_id)
-        camera_stream = CameraStream()
-        pose_estimator = PoseEstimator()
-        fall_detector = FallDetector()
-        self.pose_service = PoseDetectionService(
-            camera=camera_stream,
-            pose=pose_estimator,
-            detector=fall_detector,
-            status_callback=self._handle_pose_status,  # callback method
-        )
 
-        # Initialize robot connection
+        # LiveKit session bridge (set in entrypoint after session.start()).
+        # Needed because pose callbacks run on a worker thread and cannot directly
+        # "return" data into the LLM context.
+        self._lk_session: Optional[AgentSession] = None
+        self._lk_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._lk_ready: bool = False
+        self._pending_llm_instructions: list[str] = []
+        self._pending_llm_lock = threading.Lock()
+
+        # Initialize single shared robot connection
         self.robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
         self.robot = LeKiwi(self.robot_config)
-        self.robot.connect()
+        self.robot.connect(calibrate=False)
 
-        # Initialize navigator with robot instance
-        self.navigator = Navigator(self.robot)
+        # Lock to serialize access to robot motor commands (serial port is not thread-safe)
+        self.robot_lock = threading.Lock()
+
+        # Three services running on separate threads, with agent dispatching events to them
+        # Pass shared robot instance and lock to avoid multiple connections and serial port conflicts
+        self.wheels_service = WheelsService(
+            robot=self.robot, robot_lock=self.robot_lock
+        )
+        self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
+
+        # Pose service camera selection:
+        # - Defaults to index 0
+        # - Override at runtime via POSE_CAMERA_INDEX=1 (or 2, 3, ...)
+        pose_camera_index = int(os.getenv("POSE_CAMERA_INDEX", "1"))
+        self.pose_service = PoseDetectionService(
+            status_callback=self._handle_pose_status,
+            camera=CameraStream(index=pose_camera_index),
+            visualizer=default_visualizer,
+        )
+
+        # Main_thread (blocking) services
+        # Initialize navigator with robot instance and lock
+        self.navigator = Navigator(self.robot, robot_lock=self.robot_lock)
 
         # Initialize epipen service with robot instance
         from lekiwi.services.epipen import EpipenService
@@ -128,44 +148,53 @@ class LeTars(Agent):
 
         # Initialize workflow service
         self.workflow_service = WorkflowService()
-        # Pass agent instance to workflow service for dynamic tool registration
         self.workflow_service.set_agent(self)
 
-        # Initialize operational mode (normal or emergency)
+        # Initialize operational mode (normal, concerned, or emergency)
         self.operational_mode = "normal"
-
-        # Session reference for triggering LLM responses (set after session creation)
-        # Using _agent_session to avoid conflict with Agent base class's session property
-        self._agent_session: Optional["AgentSession"] = None
-        # Filled in after session creation (used by tools)
-        self.current_room_name: Optional[str] = None
 
         # Start robot services
         self.wheels_service.start()
         self.arms_service.start()
         self.pose_service.start()
 
-        # Optional data streaming (to anyone listening)
-        # TODO: This should probably exist in the pose detection worker thread instead
-        self.stream_data = stream_data
-        self.zmq_pub = None
-        if stream_data:
-            import zmq
-
-            context = zmq.Context()
-            self.zmq_pub = context.socket(zmq.PUB)
-            self.zmq_pub.setsockopt(zmq.CONFLATE, 1)
-            self.zmq_pub.bind(f"tcp://*:{stream_port}")
-            print(f"ZMQ Publisher on LeKiwi bound to port {stream_port}")
-
         # Wake up animation
         self.arms_service.dispatch("play", "wake_up")
 
-    def _publish_sensor_data(self, data_type: str, data: dict):
-        """Publish sensor data to ZMQ stream if enabled."""
-        if self.zmq_pub:
-            message = {"type": data_type, "timestamp": time.time(), "data": data}
-            self.zmq_pub.send_json(message)
+    def _enqueue_or_send_llm_instructions(self, instructions: str) -> None:
+        """
+        Thread-safe bridge: enqueue instructions until LiveKit session is ready,
+        otherwise schedule a generate_reply() on the LiveKit asyncio loop.
+        """
+        # If session isn't ready yet, queue the message.
+        if not self._lk_ready or self._lk_session is None or self._lk_loop is None:
+            with self._pending_llm_lock:
+                self._pending_llm_instructions.append(instructions)
+            return
+
+        # Schedule async call from this (possibly non-async) context safely.
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                _generate_reply(self._lk_session, instructions),
+                self._lk_loop,
+            )
+            # Don't block; optionally force exception propagation in logs.
+            fut.add_done_callback(
+                lambda f: f.exception()
+                and logger.error(
+                    "LeKiwi: generate_reply failed from callback: %s", f.exception()
+                )
+            )
+        except Exception as e:
+            logger.error("LeKiwi: failed to schedule generate_reply: %s", e)
+
+    def __del__(self):
+        """Cleanup: disconnect robot when agent is destroyed"""
+        if hasattr(self, "robot") and self.robot:
+            try:
+                self.robot.disconnect()
+            except:
+                pass  # Ignore errors during cleanup
 
     def _handle_pose_status(self, status_type: str, details: dict):
         """
@@ -176,32 +205,35 @@ class LeTars(Agent):
             f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
         )
 
-        # Stream pose data if enabled
-        if self.stream_data:
-            self._publish_sensor_data(
-                "pose",
-                {
-                    "status": status_type,
-                    "score": details.get("score", 0.0),
-                    "ratio": details.get("ratio", 0.0),
-                },
-            )
-
         if status_type == "PERSON_FALLEN":
-            # The main thread (LiveKit orchestrator) decides what to do
-            # In an Agent, this often means generating a reply or dispatching a motor action.
+            # Switch to concerned mode when person falls
+            if self.operational_mode != "concerned":
+                self.operational_mode = "concerned"
+                print(f"LeKiwi: Person fallen detected, switching to concerned mode")
+                # Start the help workflow automatically
+                try:
+                    self.workflow_service.start_workflow("help")
+                    logger.info("LeKiwi: Started help workflow due to person fallen")
 
-            # Example 1: Use the LLM to generate an urgent reply
-            # You would need a mechanism to break into the current LLM flow.
-            # For simplicity, let's dispatch an action for now.
-
-            # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            # log it
-            print(f"LeKiwi: Person fallen detected, dispatching concerned mode")
-
-            # Example 3: Log the event for the main LLM loop to pick up (complex, but robust)
-            # You might set a flag or put an event in a queue monitored by the agent's reply loop.
-            pass
+                    # Pull the next step immediately and inject into the LLM context.
+                    # This callback runs on a worker thread; use the session bridge.
+                    next_step = self.workflow_service.get_next_step()
+                    self._enqueue_or_send_llm_instructions(
+                        "PERSON_FALLEN detected. Entering concerned mode.\n\n"
+                        "[HELP WORKFLOW STARTED]\n"
+                        f"Next step:\n{next_step}\n\n"
+                        "Follow the workflow strictly. After completing the step, call complete_step()."
+                    )
+                except Exception as e:
+                    logger.error(f"LeKiwi: Error starting help workflow: {e}")
+        elif status_type == "PERSON_STABLE":
+            # Switch back to normal mode when person is stable
+            if self.operational_mode != "normal":
+                self.operational_mode = "normal"
+                print(f"LeKiwi: Person stable detected, switching to normal mode")
+                self._enqueue_or_send_llm_instructions(
+                    "PERSON_STABLE detected. Returning to normal mode."
+                )
 
     @function_tool
     async def get_available_recordings(self) -> str:
@@ -218,6 +250,7 @@ class LeTars(Agent):
         print("LeKiwi: get_available_recordings function called")
         try:
             recordings = self.arms_service.get_available_recordings()
+            recordings += self.wheels_service.get_available_recordings()
 
             if recordings:
                 result = f"Available recordings: {', '.join(recordings)}"
@@ -230,7 +263,7 @@ class LeTars(Agent):
             return result
 
     @function_tool
-    async def play_recording(self, recording_name: str) -> str:
+    async def play_recording(self, recording_name: str, type: str = "arms") -> str:
         """
         Express yourself through physical movement! Use this constantly to show personality and emotion.
         Perfect for: greeting gestures, excited bounces, confused head tilts, thoughtful nods,
@@ -240,13 +273,19 @@ class LeTars(Agent):
 
         Args:
             recording_name: Name of the physical expression to perform (use get_available_recordings first)
+            type: arms or wheels
         """
         print(
             f"LeKiwi: play_recording function called with recording_name: {recording_name}"
         )
         try:
             # Send play event to animation service
-            self.arms_service.dispatch("play", recording_name)
+            if type == "arms":
+                self.arms_service.dispatch("play", recording_name)
+            elif type == "wheels":
+                self.wheels_service.dispatch("play", recording_name)
+            else:
+                return f"Error: type must be either 'arms' or 'wheels', got '{type}'"
             result = f"Started playing recording: {recording_name}"
             return result
         except Exception as e:
@@ -501,11 +540,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     session = AgentSession(llm=openai.realtime.RealtimeModel(voice="verse"))
 
-    # Make room/session info available to tools that need to target the active room
-    agent.current_room_name = getattr(ctx, "room", None) and getattr(
-        ctx.room, "name", None
-    )
-    agent._agent_session = session
+    # Store session + loop on the agent so background threads (pose callbacks)
+    # can safely schedule LLM replies once the session is started.
+    agent._lk_session = session
+    agent._lk_loop = asyncio.get_running_loop()
 
     await session.start(
         room=ctx.room,
@@ -516,6 +554,18 @@ async def entrypoint(ctx: agents.JobContext):
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
+
+    # Mark session ready and flush any queued instructions from early callbacks.
+    agent._lk_ready = True
+    with agent._pending_llm_lock:
+        pending = list(agent._pending_llm_instructions)
+        agent._pending_llm_instructions.clear()
+    for msg in pending:
+        # Schedule on the running loop; we're already inside it.
+        try:
+            await session.generate_reply(instructions=msg)
+        except Exception as e:
+            logger.error("LeKiwi: failed to flush queued instruction: %s", e)
 
     await session.generate_reply(
         instructions=f"""When you wake up, greet with: 'Systems nominal. What's the plan?' or 'All systems operational. Nice to see you sir.'"""

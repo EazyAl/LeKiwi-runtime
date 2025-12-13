@@ -10,21 +10,38 @@ from lekiwi.robot import LeKiwi
 class ArmsService:
     def __init__(
         self,
-        port: str,
-        robot_id: str,
+        port: str = None,
+        robot_id: str = None,
+        robot: LeKiwi = None,
+        robot_lock: threading.Lock = None,
         fps: int = 30,
         duration: float = 5.0,
         idle_recording: str = "idle",
     ):
-        self.port = port
-        self.robot_id = robot_id
+        if robot is not None:
+            # Use provided robot instance (shared connection)
+            self.robot = robot
+            self.robot_lock = robot_lock if robot_lock is not None else threading.Lock()
+            self._owns_robot = False
+            self.port = None
+            self.robot_id = None
+        else:
+            # Create own robot connection (backward compatibility)
+            if port is None or robot_id is None:
+                raise ValueError(
+                    "Either robot instance or (port, robot_id) must be provided"
+                )
+            self.robot = None
+            self._owns_robot = True
+            self.port = port
+            self.robot_id = robot_id
+            self.robot_lock = threading.Lock()  # Own lock if creating own connection
+            self.robot_config = LeKiwiConfig(
+                port=port, id=robot_id, cameras={}
+            )  # TODO: add cameras later if needed
         self.fps = fps
         self.duration = duration
         self.idle_recording = idle_recording
-        self.robot_config = LeKiwiConfig(
-            port=port, id=robot_id, cameras={}
-        )  # TODO: add cameras later if needed
-        self.robot: LeKiwi | None = None
         self.recordings_dir = os.path.join(
             os.path.dirname(__file__), "..", "..", "recordings", "arm"
         )
@@ -45,9 +62,12 @@ class ArmsService:
         self._event_thread: Optional[threading.Thread] = None
 
     def start(self):
-        self.robot = LeKiwi(self.robot_config)
-        self.robot.connect(calibrate=False)
-        print(f"Arms service connected to {self.port}")
+        if self._owns_robot:
+            self.robot = LeKiwi(self.robot_config)
+            self.robot.connect(calibrate=False)
+            print(f"Arms service connected to {self.port}")
+        else:
+            print("Arms service using shared robot connection")
 
         # Start event processing thread
         self._running.set()
@@ -63,7 +83,7 @@ class ArmsService:
         if self._event_thread and self._event_thread.is_alive():
             self._event_thread.join(timeout=timeout)
 
-        if self.robot:
+        if self._owns_robot and self.robot:
             self.robot.disconnect()
             self.robot = None
 
@@ -129,7 +149,6 @@ class ArmsService:
             self._interpolation_frames = 0
             self._interpolation_target = None
 
-
     def _continue_playback(self):
         """Continue current playback - called every frame"""
         if not self._current_recording or not self._current_actions:
@@ -160,8 +179,9 @@ class ArmsService:
                         current_val + (target_val - current_val) * progress
                     )
 
-                # Send arm action directly using the new method
-                self.robot.send_arm_action(interpolated_action)
+                # Send arm action directly using the new method (with lock for thread safety)
+                with self.robot_lock:
+                    self.robot.send_arm_action(interpolated_action)
                 self._current_state = interpolated_action.copy()
                 self._interpolation_frames -= 1
                 return
@@ -169,8 +189,9 @@ class ArmsService:
             # Play current frame
             if self._current_frame_index < len(self._current_actions):
                 action = self._current_actions[self._current_frame_index]
-                # Send arm action directly using the new method
-                self.robot.send_arm_action(action)
+                # Send arm action directly using the new method (with lock for thread safety)
+                with self.robot_lock:
+                    self.robot.send_arm_action(action)
                 self._current_state = action.copy()
                 self._current_frame_index += 1
             else:
@@ -223,8 +244,7 @@ class ArmsService:
         csv_path = os.path.join(self.recordings_dir, csv_filename)
 
         if not os.path.exists(csv_path):
-            print(f"Recording not found: {csv_path}")
-            return None
+            raise FileNotFoundError(f"Recording not found: {csv_path}")
 
         try:
             with open(csv_path, "r") as csvfile:

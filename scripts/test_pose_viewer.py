@@ -3,6 +3,7 @@ Standalone viewer for pose + fall detection + quality metrics.
 Uses the default webcam (index 0). Press 'q' to quit.
 """
 
+import os
 import cv2
 import time
 import mediapipe as mp
@@ -123,7 +124,9 @@ def draw_overlay(
 
 
 def main():
-    cap = cv2.VideoCapture(0)
+    camera_index = int(os.getenv("POSE_CAMERA_INDEX", "0"))
+    print(f"Using camera index: {camera_index} (override via POSE_CAMERA_INDEX=...)")
+    cap = cv2.VideoCapture(camera_index)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     pose = PoseEstimator()
