@@ -121,7 +121,7 @@ def draw_overlay(frame, result, event, is_fall: bool, fps: float, quality: dict,
 
 
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     pose = PoseEstimator()
