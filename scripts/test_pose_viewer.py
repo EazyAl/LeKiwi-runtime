@@ -23,7 +23,7 @@ from lekiwi.vision import (
 
 
 def draw_overlay(
-    frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict
+    frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict, draw_text: bool = True
 ) -> bool:
     """Custom viewer with larger text overlays."""
     label = "FALL" if is_fall else "OK"
@@ -50,79 +50,90 @@ def draw_overlay(
             landmark_drawing_spec=None,
             connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style(),
         )
+    
+    if not draw_text:
+        return False
 
-    if draw_text:
-        cv2.putText(frame, label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.8, color, 5)
-        cv2.putText(
-            frame,
-            f"torso ratio {ratio_txt}  score {score_txt}",
-            (10, 105),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.2,
-            (255, 255, 255),
-            3,
-        )
-        cv2.putText(
-            frame,
-            f"bright {quality['brightness']:.0f}  blur {quality['blur']:.0f}  motion {quality['motion']:.1f}",
-            (10, 145),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"vis_min {quality['visibility_min']:.2f}  vis_mean {quality['visibility_mean']:.2f}",
-            (10, 180),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"FPS {fps:.1f}",
-            (10, 215),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-        )
+    cv2.putText(frame, label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.8, color, 5)
+    cv2.putText(
+        frame,
+        f"torso ratio {ratio_txt}  score {score_txt}",
+        (10, 105),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        3,
+    )
+    cv2.putText(
+        frame,
+        f"bright {quality['brightness']:.0f}  blur {quality['blur']:.0f}  motion {quality['motion']:.1f}",
+        (10, 145),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"vis_min {quality['visibility_min']:.2f}  vis_mean {quality['visibility_mean']:.2f}",
+        (10, 180),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"FPS {fps:.1f}",
+        (10, 215),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+    )
 
-        # Face stats always visible (with defaults)
-        cv2.putText(
-            frame,
-            f"awake {face_stats.get('awake_likelihood', -1):.2f}  blinks/min {face_stats.get('blinks_per_min', 0):.1f}  perclos {face_stats.get('perclos', 0):.2f}  eyes_open {face_stats.get('eyes_open_prob', 0):.2f}",
-            (10, 250),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"HR {face_stats.get('hr_bpm', -1):.0f} bpm  q {face_stats.get('hr_quality', 0):.2f}  method {face_stats.get('hr_method', '')}",
-            (10, 280),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"face_status {face_stats.get('face_status', 'no_face')}",
-            (10, 310),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            2,
-        )
+    # Face stats always visible (with defaults)
+    cv2.putText(
+        frame,
+        f"awake {face_stats.get('awake_likelihood', -1):.2f}  blinks/min {face_stats.get('blinks_per_min', 0):.1f}  perclos {face_stats.get('perclos', 0):.2f}  eyes_open {face_stats.get('eyes_open_prob', 0):.2f}",
+        (10, 250),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"HR {face_stats.get('hr_bpm', -1):.0f} bpm  q {face_stats.get('hr_quality', 0):.2f}  method {face_stats.get('hr_method', '')}",
+        (10, 280),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"face_status {face_stats.get('face_status', 'no_face')}",
+        (10, 310),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 255),
+        2,
+    )
+    
+    return False
 
 
-def process_pose_stream(video_source=0, draw_text=True):
-    cap = cv2.VideoCapture(video_source)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+def process_pose_stream(video_sources=[0], draw_text=True):
+    # Ensure video_sources is a list
+    if not isinstance(video_sources, (list, tuple)):
+        video_sources = [video_sources]
+
+    caps = []
+    for src in video_sources:
+        cap = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        caps.append(cap)
 
     pose = PoseEstimator()
     detector = FallDetector()
@@ -136,21 +147,27 @@ def process_pose_stream(video_source=0, draw_text=True):
     last_is_fall = False
 
     try:
-        while cap.isOpened():
-            ok, frame = cap.read()
-            if not ok:
-                print("Error: Could not read frame from camera")
+        while all(cap.isOpened() for cap in caps):
+            frames = []
+            for cap in caps:
+                ok, frame = cap.read()
+                if not ok:
+                    print("Error: Could not read frame from camera")
+                    break
+                frames.append(frame)
+            
+            if len(frames) != len(caps):
                 break
 
-        result = pose.infer(frame)
-        landmarks = (
-            result.pose_landmarks.landmark if result and result.pose_landmarks else None
-        )
+            # Process the first camera for pose/fall detection (primary)
+            main_frame = frames[0]
+            result = pose.infer(main_frame)
+            landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
 
-        quality = compute_quality_metrics(
-            frame, prev_gray, landmarks, downscale_width=320
-        )
-        prev_gray = quality.pop("gray", None)
+            quality = compute_quality_metrics(
+                main_frame, prev_gray, landmarks, downscale_width=320
+            )
+            prev_gray = quality.pop("gray", None)
 
             event = None
             is_fall = last_is_fall
@@ -165,18 +182,18 @@ def process_pose_stream(video_source=0, draw_text=True):
             fps = 1.0 / max(now - last_time, 1e-6)
             last_time = now
 
-        face_stats = {
-            "face_status": "no_face",
-            "hr_method": "",
-        }
-        face_result = face_lm.infer(frame)
-        if face_result.multi_face_landmarks:
-            face_lms = face_result.multi_face_landmarks[0].landmark
-            h, w, _ = frame.shape
-            face_box = compute_face_box(face_lms, w, h)
-            eyes = compute_eye_metrics(face_lms, w, h)
-            awake = blink_awake.update(eyes["ear_mean"], timestamp=now)
-            hr = rppg.update(frame, face_box, timestamp=now)
+            face_stats = {
+                "face_status": "no_face",
+                "hr_method": "",
+            }
+            face_result = face_lm.infer(main_frame)
+            if face_result.multi_face_landmarks:
+                face_lms = face_result.multi_face_landmarks[0].landmark
+                h, w, _ = main_frame.shape
+                face_box = compute_face_box(face_lms, w, h)
+                eyes = compute_eye_metrics(face_lms, w, h)
+                awake = blink_awake.update(eyes["ear_mean"], timestamp=now)
+                hr = rppg.update(frame, face_box, timestamp=now)
 
                 face_stats = {
                     **eyes,
@@ -188,13 +205,37 @@ def process_pose_stream(video_source=0, draw_text=True):
                     "hr_method": hr.get("method", ""),
                 }
 
-        stop = draw_overlay(
-            frame, result, event or last_event, is_fall, fps, quality, face_stats
-        )
-        if stop:
-            break
-    cv2.destroyAllWindows()
+            stop = draw_overlay(
+                main_frame, result, event or last_event, is_fall, fps, quality, face_stats, draw_text=draw_text
+            )
+
+            # Construct a dictionary with all the data for external consumers
+            data_context = {
+                "result": result,
+                "event": event or last_event,
+                "is_fall": is_fall,
+                "fps": fps,
+                "quality": quality,
+                "face_stats": face_stats
+            }
+                
+            yield frames, data_context
+            
+            if stop:
+                break
+    finally:
+        for cap in caps:
+            cap.release()
+        pose.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    # When run directly, consume the generator and show the window
+    for frames, _ in process_pose_stream():
+        cv2.imshow("Fall Detection Viewer", frames[0])
+        if len(frames) > 1:
+             cv2.imshow("Secondary Camera", frames[1])
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break

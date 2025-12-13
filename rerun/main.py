@@ -42,14 +42,26 @@ def main():
     
     print("Starting pose stream...")
     
-    # Use video source 2 as per user's previous modification
+    # Try multiple camera indices: [0, 4] (assuming user might have a second cam at 4, or 2)
+    # The user previously used 4, so let's try [4, 0] or [0, 4]
+    # Let's assume 4 is the primary (as per last edit) and we look for another one, maybe 0 or 2.
+    # We'll pass a list of potential indices.
+    camera_indices = [4, 2] 
+    
     # Pass draw_text=False so stats aren't burned into the video
     try:
-        for frame, context in process_pose_stream(2, draw_text=False):
-            # Frame is BGR from OpenCV, Rerun expects RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # process_pose_stream now accepts a list and returns a list of frames
+        for frames, context in process_pose_stream(camera_indices, draw_text=False):
             
-            rr.log("video/stream", rr.Image(frame_rgb))
+            # Log Primary Camera (Index 4)
+            if len(frames) > 0 and frames[0] is not None:
+                frame_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
+                rr.log("video/stream_primary", rr.Image(frame_rgb))
+            
+            # Log Secondary Camera (Index 0)
+            if len(frames) > 1 and frames[1] is not None:
+                frame_rgb_sec = cv2.cvtColor(frames[1], cv2.COLOR_BGR2RGB)
+                rr.log("video/stream_secondary", rr.Image(frame_rgb_sec))
             
             # Extract stats from context
             event = context.get("event")
