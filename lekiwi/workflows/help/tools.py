@@ -47,23 +47,32 @@ def _guard_emergency_only(agent) -> str | None:
 @function_tool
 async def navigate_to_administration_point(self) -> str:
     """
-    Navigate to the epipen administration point. Move the robot to the person
-    who needs the epipen administered.
+    Navigate to the person in need. Move the robot to the person's location
+    so the epipen can be administered. This will:
+    1. Locate the person using pose detection
+    2. Rotate to their thigh for proper orientation
+    3. Drive forward to an appropriate interaction distance
+    4. Block until the complete sequence finishes
 
     Returns:
-        Confirmation message indicating successful navigation to administration point.
+        Confirmation message indicating successful navigation to the person.
     """
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
+
     logger.debug("LeKiwi: navigate_to_administration_point function called")
+
+    # Run navigation synchronously - blocks until complete
     try:
         result = self.navigator.navigate_to_person()
-        logger.info(f"LeKiwi: navigate_to_administration_point completed: {result}")
+        logger.info(
+            f"LeKiwi: navigate_to_administration_point completed with result: {result}"
+        )
         return result
     except Exception as e:
-        error_msg = f"Navigation to administration point failed: {str(e)}"
-        logger.error(f"LeKiwi: {error_msg}")
+        error_msg = f"Navigation failed: {str(e)}"
+        logger.error(f"LeKiwi: navigate_to_administration_point failed: {error_msg}")
         return error_msg
 
 
@@ -123,12 +132,7 @@ async def call_emergency_services(self) -> str:
     # Type narrowing for static checkers (os.getenv returns Optional[str])
     assert livekit_url and api_key and api_secret and sip_trunk_id
 
-    room_name = getattr(self, "current_room_name", None)
-    if not room_name:
-        room_name = "emergency-help-room"
-        logger.warning(
-            "LeKiwi: current_room_name was not set; using fallback room '%s'", room_name
-        )
+    room_name = "emergency-help-room"
 
     payload = {
         "sip_trunk_id": sip_trunk_id,
@@ -271,7 +275,6 @@ async def navigate_to_person(self) -> str:
 async def administer_epipen(self) -> str:
     """
     Administer the epipen to the person in need using advanced VLA control.
-    Uses π₀.₅ vision-language-action model for precise epipen administration.
     This blocks until the epipen administration is complete.
 
     Returns:
@@ -280,8 +283,6 @@ async def administer_epipen(self) -> str:
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
-
-    logger.debug("LeKiwi: administer_epipen function called")
 
     # Check if service is ready
     if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():

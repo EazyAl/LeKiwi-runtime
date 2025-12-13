@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import collections
 import time
-import threading
-import logging
 from dataclasses import dataclass
 from typing import Callable, Optional, Any, Dict
 
@@ -13,8 +11,10 @@ import cv2
 import mediapipe as mp
 
 # Assuming these are available from your common service files
-from ..base import ServiceBase, Priority, ServiceEvent
+from ..base import ServiceBase
 from ...vision import FrameRingBuffer, compute_quality_metrics
+
+_WARNED_OPENCV_GUI = False
 
 
 @dataclass
@@ -115,11 +115,10 @@ class PoseDetectionService(ServiceBase):
 
     def __init__(
         self,
-        camera: CameraStream,
-        pose: PoseEstimator,
-        detector: FallDetector,
-        # Renamed to match the callback style discussed previously
         status_callback: EventHandler,
+        camera: Optional[CameraStream] = None,
+        pose: Optional[PoseEstimator] = None,
+        detector: Optional[FallDetector] = None,
         visualizer: Optional[VisualizerFn] = None,
         target_width: Optional[int] = None,
         frame_skip: int = 1,
@@ -128,10 +127,10 @@ class PoseDetectionService(ServiceBase):
     ) -> None:
         super().__init__("pose_detection")
 
-        # Core components
-        self.camera = camera
-        self.pose = pose
-        self.detector = detector
+        # Core components - create defaults if not provided
+        self.camera = camera if camera is not None else CameraStream()
+        self.pose = pose if pose is not None else PoseEstimator()
+        self.detector = detector if detector is not None else FallDetector()
         self.status_callback = status_callback  # The function to call back to LeKiwi
         self.visualizer = visualizer
         self.ring_buffer = FrameRingBuffer(max_seconds=10.0, maxlen=300)
@@ -258,9 +257,16 @@ class PoseDetectionService(ServiceBase):
             if process_this:
                 infer_frame = self._resize_for_infer(frame)
                 result = self.pose.infer(infer_frame)
-                landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
+                landmarks = (
+                    result.pose_landmarks.landmark
+                    if result and result.pose_landmarks
+                    else None
+                )
                 quality = compute_quality_metrics(
-                    frame, self._prev_gray, landmarks, downscale_width=self.target_width or 320
+                    frame,
+                    self._prev_gray,
+                    landmarks,
+                    downscale_width=self.target_width or 320,
                 )
                 gray = quality.pop("gray", None)
                 self._prev_gray = gray
@@ -406,5 +412,20 @@ def default_visualizer(
         (255, 255, 255),
         2,
     )
-    cv2.imshow("Fall Detection (MediaPipe Pose)", frame)
-    return bool(cv2.waitKey(1) & 0xFF == ord("q"))
+    try:
+        cv2.imshow("Fall Detection (MediaPipe Pose)", frame)
+        return bool(cv2.waitKey(1) & 0xFF == ord("q"))
+    except cv2.error as e:
+        # OpenCV GUI not available (headless mode, worker thread on macOS, etc.)
+        # We warn once so users don't think it's "just stuck".
+        global _WARNED_OPENCV_GUI
+        if not _WARNED_OPENCV_GUI:
+            _WARNED_OPENCV_GUI = True
+            print(
+                "[pose_service] OpenCV window could not be opened. "
+                "This commonly happens on macOS when cv2.imshow() is called from a background thread "
+                "(PoseDetectionService runs in a worker thread). "
+                "To verify the camera feed, run `uv run scripts/test_pose_detection.py` "
+                "and set POSE_CAMERA_INDEX=...; then use the same POSE_CAMERA_INDEX for main_workflows."
+            )
+        return False
