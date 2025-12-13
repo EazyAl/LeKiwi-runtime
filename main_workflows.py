@@ -1,6 +1,7 @@
 import os
-import asyncio
 import threading
+import sys
+import asyncio
 import logging
 from pathlib import Path
 import time
@@ -35,10 +36,20 @@ from lekiwi.services.pose_detection.pose_service import (
 )
 from lekiwi.workflows.workflows import WorkflowService
 from lekiwi.services.navigation import Navigator
+from lekiwi.vision.camera_hub import CameraHub
+from lekiwi.viz.rerun_viz import create_viz, NullViz
 
 # import zmq
 
 load_dotenv()
+
+_RUN_ARGS = {
+    "stream_enabled": False,
+    "stream_port": 5556,
+    "front_idx": 0,
+    "wrist_idx": 2,
+    "viz_enabled": False,
+}
 
 
 async def _generate_reply(session: AgentSession, instructions: str) -> None:
@@ -100,6 +111,9 @@ class LeTars(Agent):
         robot_id: str = "biden_kiwi",
         stream_data: bool = False,
         stream_port: int = 5556,
+        viz_enabled: bool = False,
+        front_camera_index: int = 0,
+        wrist_camera_index: int = 2,
     ):
         super().__init__(instructions=_load_system_prompt())
 
@@ -117,6 +131,33 @@ class LeTars(Agent):
         self.robot = LeKiwi(self.robot_config)
         self.robot.connect(calibrate=False)
 
+        # Visualization wiring
+        self.viz_enabled = viz_enabled
+        self.viz = create_viz(viz_enabled, app_id="lekiwi_viz")
+        self.camera_hub = None
+        self.front_sub_pose = None
+        self.front_sub_nav = None
+        self.front_sub_viz = None
+        self.wrist_sub_viz = None
+        if self.viz_enabled:
+            self.camera_hub = CameraHub(
+                front_index=front_camera_index,
+                wrist_index=wrist_camera_index,
+                fps=30,
+            )
+            self.camera_hub.start()
+            self.front_sub_pose = self.camera_hub.subscribe_front(max_queue=2)
+            self.front_sub_nav = self.camera_hub.subscribe_front(max_queue=2)
+            self.wrist_sub_viz = self.camera_hub.subscribe_wrist(max_queue=2)
+            self._start_camera_pumps()
+            self.viz.set_status("normal", ts=time.time())
+        else:
+            self.viz = NullViz()
+            self.camera_hub = None
+            self.front_sub_pose = None
+            self.front_sub_nav = None
+            self.wrist_sub_viz = None
+
         # Lock to serialize access to robot motor commands (serial port is not thread-safe)
         self.robot_lock = threading.Lock()
 
@@ -128,18 +169,22 @@ class LeTars(Agent):
         self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
 
         # Pose service camera selection:
-        # - Defaults to index 0
-        # - Override at runtime via POSE_CAMERA_INDEX=1 (or 2, 3, ...)
-        pose_camera_index = int(os.getenv("POSE_CAMERA_INDEX", "1"))
         self.pose_service = PoseDetectionService(
             status_callback=self._handle_pose_status,
-            camera=CameraStream(index=pose_camera_index),
-            visualizer=default_visualizer,
+            camera=CameraStream(index=front_camera_index),
+            visualizer=None if self.viz_enabled else default_visualizer,
+            frame_subscription=self.front_sub_pose,
+            viz=self.viz,
         )
 
         # Main_thread (blocking) services
         # Initialize navigator with robot instance and lock
-        self.navigator = Navigator(self.robot, robot_lock=self.robot_lock)
+        self.navigator = Navigator(
+            self.robot,
+            robot_lock=self.robot_lock,
+            viz=self.viz,
+            frame_subscription=self.front_sub_nav,
+        )
 
         # Initialize epipen service with robot instance
         from lekiwi.services.epipen import EpipenService
@@ -151,7 +196,8 @@ class LeTars(Agent):
         self.workflow_service.set_agent(self)
 
         # Initialize operational mode (normal, concerned, or emergency)
-        self.operational_mode = "normal"
+        self.status = "normal"
+        self._push_status_to_viz()
 
         # Start robot services
         self.wheels_service.start()
@@ -160,6 +206,44 @@ class LeTars(Agent):
 
         # Wake up animation
         self.arms_service.dispatch("play", "wake_up")
+
+    def _start_camera_pumps(self):
+        """Pump camera frames into viz in background threads."""
+        if not self.viz_enabled or not self.camera_hub:
+            return
+
+        sub = self.wrist_sub_viz
+        if not sub:
+            return
+
+        def pump_wrist():
+            while True:
+                pulled = sub.pull(timeout=0.5)
+                if pulled:
+                    ts, frame = pulled
+                    self.viz.log_wrist_rgb(frame, ts=ts)
+
+        threading.Thread(target=pump_wrist, name="viz-wrist-pump", daemon=True).start()
+
+    def _push_status_to_viz(self):
+        if not self.viz:
+            return
+        try:
+            self.viz.set_status(self.status, ts=time.time())
+        except Exception:
+            pass
+
+    def _log_tool(
+        self, name: str, message: str, level: str = "info", emoji: str = "🧰"
+    ):
+        if not getattr(self, "viz", None):
+            return
+        try:
+            self.viz.log_tool_call(
+                name, message, level=level, emoji=emoji, ts=time.time()
+            )
+        except Exception:
+            pass
 
     def _enqueue_or_send_llm_instructions(self, instructions: str) -> None:
         """
@@ -195,6 +279,15 @@ class LeTars(Agent):
                 self.robot.disconnect()
             except:
                 pass  # Ignore errors during cleanup
+        try:
+            hub = getattr(self, "camera_hub", None)
+            if hub is not None:
+                hub.stop()
+            viz = getattr(self, "viz", None)
+            if viz is not None:
+                viz.close()
+        except Exception:
+            pass
 
     def _handle_pose_status(self, status_type: str, details: dict):
         """
@@ -207,8 +300,9 @@ class LeTars(Agent):
 
         if status_type == "PERSON_FALLEN":
             # Switch to concerned mode when person falls
-            if self.operational_mode != "concerned":
-                self.operational_mode = "concerned"
+            if self.status != "concerned":
+                self.status = "concerned"
+                self._push_status_to_viz()
                 print(f"LeKiwi: Person fallen detected, switching to concerned mode")
                 # Start the help workflow automatically
                 try:
@@ -228,8 +322,9 @@ class LeTars(Agent):
                     logger.error(f"LeKiwi: Error starting help workflow: {e}")
         elif status_type == "PERSON_STABLE":
             # Switch back to normal mode when person is stable
-            if self.operational_mode != "normal":
-                self.operational_mode = "normal"
+            if self.status != "normal":
+                self.status = "normal"
+                self._push_status_to_viz()
                 print(f"LeKiwi: Person stable detected, switching to normal mode")
                 self._enqueue_or_send_llm_instructions(
                     "PERSON_STABLE detected. Returning to normal mode."
@@ -248,19 +343,23 @@ class LeTars(Agent):
             List of available physical expression recordings you can perform.
         """
         print("LeKiwi: get_available_recordings function called")
+        self._log_tool("get_available_recordings", "call")
         try:
             recordings = self.arms_service.get_available_recordings()
             recordings += self.wheels_service.get_available_recordings()
 
             if recordings:
                 result = f"Available recordings: {', '.join(recordings)}"
-                return result
+                level = "info"
             else:
                 result = "No recordings found."
-                return result
+                level = "info"
         except Exception as e:
             result = f"Error getting recordings: {str(e)}"
-            return result
+            level = "error"
+
+        self._log_tool("get_available_recordings", result, level=level)
+        return result
 
     @function_tool
     async def play_recording(self, recording_name: str, type: str = "arms") -> str:
@@ -278,6 +377,7 @@ class LeTars(Agent):
         print(
             f"LeKiwi: play_recording function called with recording_name: {recording_name}"
         )
+        self._log_tool("play_recording", f"call {recording_name}")
         try:
             # Send play event to animation service
             if type == "arms":
@@ -285,12 +385,15 @@ class LeTars(Agent):
             elif type == "wheels":
                 self.wheels_service.dispatch("play", recording_name)
             else:
-                return f"Error: type must be either 'arms' or 'wheels', got '{type}'"
+                result = f"Error: type must be either 'arms' or 'wheels', got '{type}'"
+                self._log_tool("play_recording", result, level="error")
+                return result
             result = f"Started playing recording: {recording_name}"
-            return result
         except Exception as e:
             result = f"Error playing recording {recording_name}: {str(e)}"
-            return result
+        level = "error" if result.lower().startswith("error") else "info"
+        self._log_tool("play_recording", result, level=level)
+        return result
 
     @function_tool
     async def get_configuration(self) -> str:
@@ -298,7 +401,9 @@ class LeTars(Agent):
         Get the status of the robot.
         """
         # TODO: Implement this with proper configuration checking and return as json () - see https://github.com/TARS-AI-Community/TARS-AI/blob/V2/src/character/TARS/persona.ini
-        return "Status: Nominal"
+        result = "Status: Nominal"
+        self._log_tool("get_configuration", result)
+        return result
 
     @function_tool
     async def toggle_state(self, mode: str) -> str:
@@ -316,11 +421,15 @@ class LeTars(Agent):
             Confirmation message indicating the current mode.
         """
         try:
+            self._log_tool("toggle_state", f"call {mode}")
             if mode not in ["emergency", "normal", "concerned"]:
-                return f"Error: mode must be either 'emergency' or 'normal' or 'concerned', got '{mode}'"
+                result = f"Error: mode must be either 'emergency' or 'normal' or 'concerned', got '{mode}'"
+                self._log_tool("toggle_state", result, level="error")
+                return result
 
             # Store the mode as an instance variable
-            self.operational_mode = mode
+            self.status = mode
+            self._push_status_to_viz()
             result = f"Switched to {mode} mode"
             logger.debug(f"LeKiwi: {result}")
 
@@ -344,10 +453,12 @@ class LeTars(Agent):
                     logger.debug(traceback.format_exc())
                     result += f". Warning: {error_msg}"
 
+            self._log_tool("toggle_state", result, level="info")
             return result
         except Exception as e:
             result = f"Error toggling state: {str(e)}"
             logger.error(f"LeKiwi: {result}")
+            self._log_tool("toggle_state", result, level="error")
             return result
 
     @function_tool
@@ -362,18 +473,22 @@ class LeTars(Agent):
             List of available workflow names you can execute.
         """
         logger.debug("LeKiwi: get_available_workflows function called")
+        self._log_tool("get_available_workflows", "call")
         try:
             workflows = self.workflow_service.get_available_workflows()
 
             if workflows:
                 result = f"Available workflows: {', '.join(workflows)}"
-                return result
+                level = "info"
             else:
                 result = "No workflows found."
-                return result
+                level = "info"
         except Exception as e:
             result = f"Error getting workflows: {str(e)}"
-            return result
+            level = "error"
+
+        self._log_tool("get_available_workflows", result, level=level)
+        return result
 
     @function_tool
     async def start_workflow(self, workflow_name: str) -> str:
@@ -387,12 +502,17 @@ class LeTars(Agent):
         logger.debug(
             f"LeKiwi: start_workflow function called with workflow_name: {workflow_name}"
         )
+        self._log_tool("start_workflow", f"call {workflow_name}")
         try:
             self.workflow_service.start_workflow(workflow_name)
-            return f"Started the workflow: {workflow_name}. You can now call the get_next_step function to get the next step."
+            result = f"Started the workflow: {workflow_name}. You can now call the get_next_step function to get the next step."
         except Exception as e:
             result = f"Error starting workflow {workflow_name}: {str(e)}"
+            self._log_tool("start_workflow", result, level="error")
             return result
+
+        self._log_tool("start_workflow", result, level="info")
+        return result
 
     @function_tool
     async def get_next_step(self) -> str:
@@ -408,10 +528,13 @@ class LeTars(Agent):
         logger.debug(f"LeKiwi: get_next_step called")
         logger.debug(f"  Active workflow: {self.workflow_service.active_workflow}")
         logger.debug(f"{'='*60}\n")
+        self._log_tool("get_next_step", "call")
 
         try:
             if self.workflow_service.active_workflow is None:
-                return "Error: No active workflow. Call start_workflow first."
+                result = "Error: No active workflow. Call start_workflow first."
+                self._log_tool("get_next_step", result, level="error")
+                return result
 
             next_step = self.workflow_service.get_next_step()
 
@@ -420,6 +543,7 @@ class LeTars(Agent):
             logger.debug(f"{next_step}")
             logger.debug(f"{'='*60}\n")
 
+            self._log_tool("get_next_step", next_step, level="info")
             return next_step
         except Exception as e:
             error_msg = f"Error getting next step: {str(e)}"
@@ -427,6 +551,7 @@ class LeTars(Agent):
             import traceback
 
             logger.debug(traceback.format_exc())
+            self._log_tool("get_next_step", error_msg, level="error")
             return error_msg
 
     @function_tool
@@ -449,6 +574,7 @@ class LeTars(Agent):
 
         logger.debug(f"\n{'='*60}")
         logger.debug(f"LeKiwi: complete_step called")
+        self._log_tool("complete_step", "call")
 
         # Debug: Check what we actually received
         frame = inspect.currentframe()
@@ -489,7 +615,9 @@ class LeTars(Agent):
 
         try:
             if self.workflow_service.active_workflow is None:
-                return "Error: No active workflow."
+                result = "Error: No active workflow."
+                self._log_tool("complete_step", result, level="error")
+                return result
 
             result = self.workflow_service.complete_step(state_updates)
 
@@ -498,6 +626,7 @@ class LeTars(Agent):
             logger.debug(f"{result}")
             logger.debug(f"{'='*60}\n")
 
+            self._log_tool("complete_step", result, level="info")
             return result
         except Exception as e:
             error_msg = f"Error completing step: {str(e)}"
@@ -505,25 +634,30 @@ class LeTars(Agent):
             import traceback
 
             logger.debug(traceback.format_exc())
+            self._log_tool("complete_step", error_msg, level="error")
             return error_msg
 
 
 # Entry to the agent
 async def entrypoint(ctx: agents.JobContext):
-    # Parse command-line args to get stream settings
-    import sys
-
-    stream_enabled = "--stream" in sys.argv
-    stream_port = 5556
-    for i, arg in enumerate(sys.argv):
-        if arg == "--stream-port" and i + 1 < len(sys.argv):
-            stream_port = int(sys.argv[i + 1])
+    # Use pre-parsed arguments from __main__
+    stream_enabled = _RUN_ARGS["stream_enabled"]
+    stream_port = _RUN_ARGS["stream_port"]
+    front_idx = _RUN_ARGS["front_idx"]
+    wrist_idx = _RUN_ARGS["wrist_idx"]
+    viz_enabled = _RUN_ARGS["viz_enabled"]
 
     # Parse which workflows to preload
     workflow_names = parse_workflow_args()
 
     # Initialize agent with streaming enabled if requested
-    agent = LeTars(stream_data=stream_enabled, stream_port=stream_port)
+    agent = LeTars(
+        stream_data=stream_enabled,
+        stream_port=stream_port,
+        viz_enabled=viz_enabled,
+        front_camera_index=front_idx,
+        wrist_camera_index=wrist_idx,
+    )
 
     # Ensure agent instance is set (should already be set in __init__, but double-check)
     if agent.workflow_service.agent_instance is None:
@@ -576,14 +710,40 @@ if __name__ == "__main__":
     # Run with: WORKFLOWS=help python main_workflows.py dev
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
         "--stream", action="store_true", help="Enable data streaming for visualization"
     )
     parser.add_argument(
         "--stream-port", type=int, default=5556, help="Port for ZMQ data streaming"
     )
+    parser.add_argument(
+        "--viz", action="store_true", help="Enable Rerun visualization (default off)"
+    )
+    parser.add_argument(
+        "--front-camera-index",
+        type=int,
+        default=1,
+        help="Override front camera index (default 0)",
+    )
+    parser.add_argument(
+        "--wrist-camera-index",
+        type=int,
+        default=0,
+        help="Override wrist camera index (default 2)",
+    )
     args, unknown = parser.parse_known_args()
+
+    # Capture custom flags for use in entrypoint and strip them from argv before LiveKit parses.
+    _RUN_ARGS["stream_enabled"] = bool(args.stream)
+    _RUN_ARGS["stream_port"] = int(args.stream_port)
+    _RUN_ARGS["viz_enabled"] = bool(args.viz)
+    _RUN_ARGS["front_idx"] = int(args.front_camera_index)
+    _RUN_ARGS["wrist_idx"] = int(args.wrist_camera_index)
+
+    # Remove parsed args so LiveKit CLI doesn't see them as unknown
+    sys.argv = [sys.argv[0]] + unknown
+
     agents.cli.run_app(
-        agents.WorkerOptions(entrypoint_fnc=entrypoint, num_idle_processes=1)
+        agents.WorkerOptions(entrypoint_fnc=entrypoint, num_idle_processes=1)  # type: ignore[arg-type]
     )

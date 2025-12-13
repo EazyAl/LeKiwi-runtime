@@ -5,14 +5,16 @@ from __future__ import annotations
 import collections
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Any, Dict
+from typing import Callable, Optional, Any, Dict, Tuple
 
 import cv2
 import mediapipe as mp
+import numpy as np
 
 # Assuming these are available from your common service files
 from ..base import ServiceBase
 from ...vision import FrameRingBuffer, compute_quality_metrics
+from lekiwi.viz.rerun_viz import NullViz
 
 _WARNED_OPENCV_GUI = False
 
@@ -121,6 +123,8 @@ class PoseDetectionService(ServiceBase):
         visualizer: Optional[VisualizerFn] = None,
         target_width: Optional[int] = None,
         frame_skip: int = 1,
+        viz=None,
+        frame_subscription: Optional[Any] = None,
     ) -> None:
         super().__init__("pose_detection")
 
@@ -132,6 +136,10 @@ class PoseDetectionService(ServiceBase):
         self.visualizer = visualizer
         self.ring_buffer = FrameRingBuffer(max_seconds=10.0, maxlen=300)
         self._prev_gray = None
+        self.viz = viz if viz is not None else NullViz()
+        # Optional external frame source (e.g., CameraHub subscription)
+        self.frame_subscription = frame_subscription
+        self._use_external_frames = frame_subscription is not None
 
         # State and configuration
         self.prev_is_fall_state = False  # Replaces self.prev_state
@@ -167,11 +175,12 @@ class PoseDetectionService(ServiceBase):
     # 1. Override start() to initialize resources
     def start(self):
         """Starts camera and worker thread."""
-        try:
-            self.camera.start()
-        except RuntimeError as e:
-            self.logger.error(f"Failed to start camera: {e}")
-            return
+        if not self._use_external_frames:
+            try:
+                self.camera.start()
+            except RuntimeError as e:
+                self.logger.error(f"Failed to start camera: {e}")
+                return
 
         super().start()
         self.logger.info("Pose Detection Service started")
@@ -180,7 +189,8 @@ class PoseDetectionService(ServiceBase):
     def stop(self, timeout: float = 5.0):
         """Stops worker thread, camera, and pose model."""
         super().stop(timeout)  # Stop the worker thread first
-        self.camera.stop()
+        if not self._use_external_frames:
+            self.camera.stop()
         self.pose.close()
         cv2.destroyAllWindows()
         self.logger.info("Pose Detection Service stopped")
@@ -220,8 +230,18 @@ class PoseDetectionService(ServiceBase):
                         self._event_available.clear()
             # ------------------------------------------------------------------
 
+            frame_ts = time.time()
             try:
-                frame = self.camera.read()
+                if self._use_external_frames and self.frame_subscription:
+                    pulled: Optional[Tuple[float, np.ndarray]] = (
+                        self.frame_subscription.pull(timeout=0.1)
+                    )
+                    if pulled is None:
+                        continue
+                    frame_ts, frame = pulled
+                else:
+                    frame = self.camera.read()
+                    frame_ts = time.time()
             except RuntimeError:
                 self.logger.error("Camera frame read failed. Stopping service.")
                 self.stop()
@@ -282,7 +302,7 @@ class PoseDetectionService(ServiceBase):
                         buf_frame,
                         landmarks,
                         quality,
-                        ts=event.timestamp if event else time.time(),
+                        ts=event.timestamp if event else frame_ts,
                     )
                 except Exception as e:
                     self.logger.debug(f"Ring buffer add failed: {e}")
@@ -290,6 +310,32 @@ class PoseDetectionService(ServiceBase):
             now = time.time()
             fps = 1.0 / max(now - self._prev_time, 1e-6)
             self._prev_time = now
+
+            # Emit pose landmarks to viz (thread-safe via event queue)
+            if self.viz:
+                try:
+                    self.viz.log_front_rgb(frame, frame_ts)
+                except Exception as e:
+                    self.logger.debug(f"Viz front log failed: {e}")
+
+            if result and result.pose_landmarks and self.viz:
+                h, w = frame.shape[:2]
+                pts = np.array(
+                    [(lm.x * w, lm.y * h) for lm in result.pose_landmarks.landmark],
+                    dtype=np.float32,
+                )
+                vis = np.array(
+                    [
+                        getattr(lm, "visibility", 0.0)
+                        for lm in result.pose_landmarks.landmark
+                    ],
+                    dtype=np.float32,
+                )
+                edges = list(mp.solutions.pose.POSE_CONNECTIONS)
+                try:
+                    self.viz.log_pose(pts, edges=edges, vis=vis, ts=frame_ts)
+                except Exception as e:
+                    self.logger.debug(f"Viz pose log failed: {e}")
 
             # Visualization (runs on every frame read, regardless of frame_skip)
             event_for_vis = event or self._last_fall_event

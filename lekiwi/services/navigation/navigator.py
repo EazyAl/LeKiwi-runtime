@@ -5,11 +5,13 @@ Navigation module for LeKiwi robot - handles person detection, alignment, and ap
 import cv2
 import time
 import threading
-from typing import Optional
+from typing import Optional, Tuple, Any
 import torch
 import numpy as np
 import mediapipe as mp
 import os
+
+from lekiwi.viz.rerun_viz import NullViz
 
 # LeKiwi imports
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
@@ -32,7 +34,13 @@ class Navigator:
     Designed to be called synchronously from workflow tools.
     """
 
-    def __init__(self, robot, robot_lock: Optional[threading.Lock] = None):
+    def __init__(
+        self,
+        robot,
+        robot_lock: Optional[threading.Lock] = None,
+        viz=None,
+        frame_subscription: Optional[Any] = None,
+    ):
         """
         Initialize navigator with robot instance.
 
@@ -42,6 +50,9 @@ class Navigator:
         """
         self.robot = robot
         self.robot_lock = robot_lock if robot_lock is not None else threading.Lock()
+        self.viz = viz if viz is not None else NullViz()
+        self.frame_subscription = frame_subscription
+        self._use_external_frames = frame_subscription is not None
 
         # Initialize components
         self.pose_estimator = PoseEstimator()
@@ -57,8 +68,11 @@ class Navigator:
             if nav_cam is not None
             else (pose_cam if pose_cam is not None else "0")
         )
-        self.cap = cv2.VideoCapture(cam_index)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        self.cap = None
+        if not self._use_external_frames:
+            self.cap = cv2.VideoCapture(cam_index)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         # Navigation parameters (can be made configurable later)
         self.target_distance = 75.0  # cm
@@ -100,7 +114,8 @@ class Navigator:
                     self.robot.stop_base()
             except Exception as e:
                 print(f"Warning: failed to stop base during navigation cleanup: {e}")
-            self.cap.release()
+            if self.cap is not None:
+                self.cap.release()
 
     def _find_and_align_person(self) -> bool:
         """
@@ -114,10 +129,10 @@ class Navigator:
         last_tracked_side = None
 
         while time.time() - start_time < self.alignment_timeout:
-            ok, frame = self.cap.read()
-            if not ok:
-                print("Camera read failed during alignment")
-                return False
+            pulled = self._pull_frame(timeout=0.2)
+            if pulled is None:
+                continue
+            frame_ts, frame = pulled
 
             h, w = frame.shape[:2]
 
@@ -188,17 +203,28 @@ class Navigator:
         consecutive_below_threshold = 0
 
         while True:
-            ok, frame = self.cap.read()
-            if not ok:
-                print("Camera read failed during approach")
-                return False
+            pulled = self._pull_frame(timeout=0.2)
+            if pulled is None:
+                continue
+            frame_ts, frame = pulled
 
             # Get depth information
             vx, vy, omega, depth_map, scores = self.mono_pilot.process_frame(frame)
+            try:
+                if self.viz:
+                    self.viz.log_depth(depth_map, frame_ts)
+            except Exception:
+                pass
 
             # Calculate distance
             mode_depth = self._get_mode_distance(depth_map)
             mode_distance = self._estimate_distance_from_depth(mode_depth)
+
+            # Publish depth for viz (on-demand during navigation)
+            try:
+                self._log_depth(depth_map)
+            except Exception:
+                pass
 
             # Check distance condition
             # Stop when we are at/inside the target distance.
@@ -250,6 +276,26 @@ class Navigator:
 
             # Small delay
             time.sleep(0.05)
+
+    def _pull_frame(self, timeout: float = 0.1) -> Optional[Tuple[float, np.ndarray]]:
+        """
+        Get a frame either from an external subscription or the local cv2 camera.
+        Returns (ts, frame) or None if unavailable.
+        """
+        if self._use_external_frames and self.frame_subscription:
+            pulled = self.frame_subscription.pull(timeout=timeout)
+            if pulled is None:
+                return None
+            return pulled
+
+        if self.cap is None:
+            return None
+
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            print("Camera read failed during navigation")
+            return None
+        return time.time(), frame
 
     def _calculate_thigh_midpoint(self, landmarks, frame_width, frame_height):
         """
@@ -430,3 +476,18 @@ class Navigator:
         mode_depth = (bin_edges[mode_bin_idx] + bin_edges[mode_bin_idx + 1]) / 2
 
         return mode_depth
+
+    def _log_depth(self, depth_map: np.ndarray):
+        """Publish depth map to viz using the same MiDaS output."""
+        if depth_map is None:
+            return
+        try:
+            depth_norm = cv2.normalize(
+                depth_map, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
+            )
+            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_MAGMA)
+            ts = time.time()
+            self.viz.log_depth(depth_color, ts=ts)
+        except Exception:
+            # Best-effort; do not break navigation
+            pass

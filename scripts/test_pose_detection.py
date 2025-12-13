@@ -3,7 +3,7 @@ Standalone viewer for pose detection and fall detection.
 Uses only components from pose_service.py. Uses the default webcam (index 0). Press 'q' to quit.
 """
 
-import os
+import argparse
 import cv2
 import time
 import mediapipe as mp
@@ -17,10 +17,18 @@ from lekiwi.services.pose_detection.pose_service import (
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Pose detection viewer")
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="OpenCV camera index (default: 0)",
+    )
+    args = parser.parse_args()
+
     # Initialize camera and pose detection components
-    camera_index = int(os.getenv("POSE_CAMERA_INDEX", "0"))
-    print(f"Using camera index: {camera_index} (override via POSE_CAMERA_INDEX=...)")
-    camera = CameraStream(index=camera_index)
+    print(f"Using camera index: {args.camera_index} (override via --camera-index)")
+    camera = CameraStream(index=args.camera_index)
     pose_estimator = PoseEstimator()
     fall_detector = FallDetector()
 

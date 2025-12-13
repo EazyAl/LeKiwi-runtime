@@ -33,10 +33,10 @@ def _guard_emergency_only(agent) -> str | None:
     Returns:
         None if execution is allowed, otherwise a user/LLM-facing message describing why it was blocked.
     """
-    mode = getattr(agent, "operational_mode", "normal")
+    mode = getattr(agent, "status", "normal")
     if mode == "normal":
         msg = (
-            "Blocked: this tool is emergency-only and will not run while operational_mode='normal'. "
+            "Blocked: this tool is emergency-only and will not run while status='normal'. "
             "Switch to 'concerned' or 'emergency' mode first (e.g., call toggle_state('concerned'))."
         )
         logger.warning(f"[HELP TOOL GUARD] {msg}")
@@ -87,8 +87,8 @@ async def call_emergency_services(self) -> str:
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         logger.info(
-            "LeKiwi: call_911_emergency blocked by guard (operational_mode=%s)",
-            getattr(self, "operational_mode", "normal"),
+            "LeKiwi: call_911_emergency blocked by guard (status=%s)",
+            getattr(self, "status", "normal"),
         )
         return guard_msg
     logger.debug("LeKiwi: call_911_emergency function called")
