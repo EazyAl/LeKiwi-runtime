@@ -171,7 +171,7 @@ class LeTars(Agent):
 
         if status_type == "PERSON_FALLEN":
             # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            self.wheels_service.dispatch("play", "spin")
+            #administer the epipen
             # log it
             print(f"LeKiwi: Person fallen detected, dispatching spin action")
             self.status = "concerned"
