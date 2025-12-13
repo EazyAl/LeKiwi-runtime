@@ -167,8 +167,9 @@ class Navigator:
                     return True
 
                 # Rotate towards the person
+                # Note: rotation sign flipped because front camera is upside down
                 rotation_angle = self._pixels_to_angle(offset_pixels, w)
-                rotation_speed = -rotation_angle * self.rotation_kp
+                rotation_speed = rotation_angle * self.rotation_kp
                 rotation_speed = np.clip(rotation_speed, -20.0, 20.0)
 
                 # Send rotation command (with lock for thread safety)

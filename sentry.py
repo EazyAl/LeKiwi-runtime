@@ -74,7 +74,7 @@ class Sentry:
         
         # --- Vision Setup ---
         # CameraHub manages the camera devices and distributes frames
-        self.camera_hub = CameraHub(front_index=0, wrist_index=1)
+        self.camera_hub = CameraHub(front_index=1, wrist_index=0)
         
         # --- Visualization Setup ---
         self.viz = create_viz(enable=True, app_id="lekiwi_sentry")
