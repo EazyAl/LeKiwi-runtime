@@ -19,6 +19,7 @@ dependencies = [
     "pyzmq>=27.1.0",
     "scipy>=1.15.3",
     "sounddevice>=0.5.3",
+    "timm>=1.0.22",
 ]
 
 [tool.uv]
