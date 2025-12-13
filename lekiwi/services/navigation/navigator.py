@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import numpy as np
 import mediapipe as mp
+import os
 
 # LeKiwi imports
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
@@ -45,7 +46,18 @@ class Navigator:
         # Initialize components
         self.pose_estimator = PoseEstimator()
         self.mono_pilot = MonoPilot()
-        self.cap = cv2.VideoCapture(0)  # Use camera 0 for workflow integration
+        # Camera selection:
+        # - Prefer NAV_CAMERA_INDEX if set
+        # - Otherwise reuse POSE_CAMERA_INDEX if set (so workflows + pose agree)
+        # - Default to 0
+        nav_cam = os.getenv("NAV_CAMERA_INDEX")
+        pose_cam = os.getenv("POSE_CAMERA_INDEX")
+        cam_index = int(
+            nav_cam
+            if nav_cam is not None
+            else (pose_cam if pose_cam is not None else "0")
+        )
+        self.cap = cv2.VideoCapture(cam_index)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         # Navigation parameters (can be made configurable later)
@@ -81,6 +93,13 @@ class Navigator:
         except Exception as e:
             return f"Navigation failed: {str(e)}"
         finally:
+            # Always attempt to stop the base if we may have been driving.
+            # This mirrors `nav/nav.py` behavior where stopping is explicit.
+            try:
+                with self.robot_lock:
+                    self.robot.stop_base()
+            except Exception as e:
+                print(f"Warning: failed to stop base during navigation cleanup: {e}")
             self.cap.release()
 
     def _find_and_align_person(self) -> bool:
@@ -155,7 +174,7 @@ class Navigator:
             time.sleep(0.05)
 
         # Timeout
-        print(".1f")
+        print(f"Alignment timeout after {self.alignment_timeout:.1f}s")
         return False
 
     def _approach_to_safe_distance(self) -> bool:
@@ -182,15 +201,29 @@ class Navigator:
             mode_distance = self._estimate_distance_from_depth(mode_depth)
 
             # Check distance condition
-            if mode_distance < 60.0:
+            # Stop when we are at/inside the target distance.
+            if mode_distance <= self.target_distance:
                 consecutive_below_threshold += 1
-                print(".1f")
+                print(
+                    f"Close distance detected ({mode_distance:.1f}cm) - "
+                    f"{consecutive_below_threshold}/{self.consecutive_frames} frames"
+                )
             else:
                 consecutive_below_threshold = 0  # Reset counter
 
             # Check if we've reached the target
             if consecutive_below_threshold >= self.consecutive_frames:
-                print(".1f")
+                # Explicitly stop the base before returning success, otherwise the last
+                # velocity command keeps the robot moving.
+                try:
+                    with self.robot_lock:
+                        self.robot.stop_base()
+                except Exception as e:
+                    print(f"Warning: failed to stop base at target distance: {e}")
+                print(
+                    f"Target reached at {mode_distance:.1f}cm after "
+                    f"{consecutive_below_threshold} consecutive frames"
+                )
                 return True
 
             # Continue driving forward (with lock for thread safety)
@@ -205,6 +238,14 @@ class Navigator:
                     )
             except Exception as e:
                 print(f"Error sending drive command: {e}")
+                # Try to stop if sending drive failed mid-approach
+                try:
+                    with self.robot_lock:
+                        self.robot.stop_base()
+                except Exception as stop_e:
+                    print(
+                        f"Warning: also failed to stop base after drive error: {stop_e}"
+                    )
                 return False
 
             # Small delay

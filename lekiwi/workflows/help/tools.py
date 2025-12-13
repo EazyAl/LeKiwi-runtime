@@ -45,7 +45,7 @@ def _guard_emergency_only(agent) -> str | None:
 
 
 @function_tool
-async def navigate_to_administration_point(self) -> str:
+async def navigate_to_person(self) -> str:
     """
     Navigate to the person in need. Move the robot to the person's location
     so the epipen can be administered. This will:
@@ -61,18 +61,16 @@ async def navigate_to_administration_point(self) -> str:
     if guard_msg is not None:
         return guard_msg
 
-    logger.debug("LeKiwi: navigate_to_administration_point function called")
+    logger.debug("LeKiwi: navigate_to_person function called")
 
-    # Run navigation synchronously - blocks until complete
+    # Run navigation synchronously (blocking). This is intentional for the demo.
     try:
         result = self.navigator.navigate_to_person()
-        logger.info(
-            f"LeKiwi: navigate_to_administration_point completed with result: {result}"
-        )
+        logger.info(f"LeKiwi: navigate_to_person completed with result: {result}")
         return result
     except Exception as e:
         error_msg = f"Navigation failed: {str(e)}"
-        logger.error(f"LeKiwi: navigate_to_administration_point failed: {error_msg}")
+        logger.error(f"LeKiwi: navigate_to_person failed: {error_msg}")
         return error_msg
 
 
@@ -237,38 +235,6 @@ def _create_sip_participant_sync(
     except Exception as e:  # pragma: no cover - network/transport errors
         logger.exception("LeKiwi: SIP CreateSIPParticipant transport error")
         return False, str(e)
-
-
-@function_tool
-async def navigate_to_person(self) -> str:
-    """
-    Navigate to a person using computer vision. This will:
-    1. Locate the person using pose detection
-    2. Rotate to their thigh for proper orientation
-    3. Drive forward to an appropriate interaction distance
-    4. Block until the complete sequence finishes
-
-    This is used during emergency situations to position the robot
-    correctly relative to a person requiring assistance.
-
-    Returns:
-        Confirmation message indicating navigation success or failure reason.
-    """
-    guard_msg = _guard_emergency_only(self)
-    if guard_msg is not None:
-        return guard_msg
-
-    logger.debug("LeKiwi: navigate_to_person function called")
-
-    # Run navigation synchronously - blocks main thread until complete
-    try:
-        result = self.navigator.navigate_to_person()
-        logger.info(f"LeKiwi: navigate_to_person completed with result: {result}")
-        return result
-    except Exception as e:
-        error_msg = f"Navigation failed: {str(e)}"
-        logger.error(f"LeKiwi: navigate_to_person failed: {error_msg}")
-        return error_msg
 
 
 @function_tool
