@@ -29,6 +29,33 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 AUDIO_DEVICE = 0
 
+class MockRobot:
+    """Mock robot for testing logic without hardware."""
+    def __init__(self):
+        self.is_connected = False
+        
+    def connect(self, calibrate=False):
+        self.is_connected = True
+        logger.info("[MockRobot] Connected")
+        
+    def disconnect(self):
+        self.is_connected = False
+        logger.info("[MockRobot] Disconnected")
+        
+    def stop_base(self):
+        logger.info("[MockRobot] stop_base called")
+        
+    def send_base_action(self, action):
+        logger.info(f"[MockRobot] send_base_action: {action}")
+        
+    def send_action(self, action):
+        logger.info(f"[MockRobot] send_action: {action}")
+        
+    def get_observation(self):
+        logger.info("[MockRobot] get_observation called")
+        # Return dummy dict to prevent immediate crash, though ACT policy might still fail
+        return {}
+
 class Sentry:
     def __init__(self):
         self.state = "NORMAL" # NORMAL, CONCERN, EMERGENCY
@@ -43,13 +70,16 @@ class Sentry:
             cameras={} # No cameras managed by LeKiwi directly
         )
         self.robot = LeKiwi(self.robot_config)
+        # self.robot = MockRobot()
         
         # --- Vision Setup ---
         # CameraHub manages the camera devices and distributes frames
-        self.camera_hub = CameraHub(front_index=0, wrist_index=2)
+        self.camera_hub = CameraHub(front_index=0, wrist_index=1)
         
         # --- Visualization Setup ---
         self.viz = create_viz(enable=True, app_id="lekiwi_sentry")
+        # Subscribe to wrist camera for visualization
+        self.wrist_sub = self.camera_hub.subscribe_wrist(max_queue=2)
         
         # --- Services Setup ---
         
@@ -72,7 +102,11 @@ class Sentry:
         )
         
         # Epipen Service
-        self.epipen_service = EpipenService(robot=self.robot)
+        self.epipen_service = EpipenService(
+            robot=self.robot,
+            front_cam_sub=self.camera_hub.subscribe_front(max_queue=1),
+            wrist_cam_sub=self.camera_hub.subscribe_wrist(max_queue=1)
+        )
         
         # State management
         self.fall_event = threading.Event()
@@ -91,6 +125,8 @@ class Sentry:
         # Start Camera Hub
         logger.info("Starting cameras...")
         self.camera_hub.start()
+        # Start wrist camera visualization pump
+        threading.Thread(target=self._pump_wrist, daemon=True, name="wrist-viz").start()
         
         # Start Pose Service
         logger.info("Starting pose detection...")
@@ -128,6 +164,18 @@ class Sentry:
         if self.robot.is_connected:
             self.robot.disconnect()
         logger.info("Sentry stopped.")
+
+    def _pump_wrist(self):
+        """Continuously pull wrist frames and send to visualization."""
+        while self.running:
+            pulled = self.wrist_sub.pull(timeout=0.1)
+            if pulled:
+                ts, frame = pulled
+                if self.viz:
+                    self.viz.log_wrist_rgb(frame, ts=ts)
+            else:
+                # Sleep briefly if no frame to avoid tight loop
+                time.sleep(0.05)
 
     def _handle_pose_status(self, status_type: str, details: dict):
         """Callback for pose detection service."""
@@ -284,4 +332,3 @@ class Sentry:
 if __name__ == "__main__":
     sentry = Sentry()
     sentry.start()
-

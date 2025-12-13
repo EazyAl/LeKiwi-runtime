@@ -28,7 +28,11 @@ class EpipenService:
     """
 
     def __init__(
-        self, robot: LeKiwi, policy_path: str = "CRPlab/lekiwi_test_act_policy_2"
+        self,
+        robot: LeKiwi,
+        policy_path: str = "CRPlab/lekiwi_test_act_policy_2",
+        front_cam_sub=None,
+        wrist_cam_sub=None,
     ):
         """
         Initialize epipen service with robot and ACT policy.
@@ -36,8 +40,12 @@ class EpipenService:
         Args:
             robot: Connected LeKiwi robot instance
             policy_path: Path to ACT policy (default: CRPlab/lekiwi_test_act_policy_2)
+            front_cam_sub: CameraSubscription for front/high camera
+            wrist_cam_sub: CameraSubscription for wrist camera
         """
         self.robot = robot
+        self.front_cam_sub = front_cam_sub
+        self.wrist_cam_sub = wrist_cam_sub
 
         if not ACT_AVAILABLE:
             logger.error("ACT policy not available. Cannot initialize EpipenService.")
@@ -95,6 +103,25 @@ class EpipenService:
                 try:
                     # Get current observation from robot
                     observation = self.robot.get_observation()
+
+                    # Inject camera frames into observation if available
+                    if self.front_cam_sub:
+                        # Try to get latest frame (non-blocking)
+                        ret = self.front_cam_sub.pull(timeout=0)
+                        if ret:
+                            _, frame = ret
+                            # Assume policy expects RGB
+                            import cv2
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            observation["cam_high"] = frame_rgb
+                    
+                    if self.wrist_cam_sub:
+                        ret = self.wrist_cam_sub.pull(timeout=0)
+                        if ret:
+                            _, frame = ret
+                            import cv2
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            observation["cam_wrist"] = frame_rgb
 
                     # Predict actions using ACT policy
                     action_tensor = self.policy.select_action(observation)
