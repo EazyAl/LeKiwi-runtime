@@ -1,5 +1,4 @@
 import logging
-import os
 from pathlib import Path
 import time
 
@@ -15,7 +14,6 @@ from livekit.plugins import (
     openai,
     noise_cancellation,
 )
-from lekiwi.services import Priority
 from lekiwi.services.motors import ArmsService, WheelsService
 from lekiwi.services.pose_detection import (
     PoseDetectionService,
@@ -44,10 +42,10 @@ def _load_system_prompt() -> str:
         )
 
 
-class LeKiwi(Agent):
+class LeTars(Agent):
     def __init__(
         self,
-        port: str = "/dev/ttyACM0",
+        port: str = "/dev/tty.usbmodem58760432781",
         robot_id: str = "biden_kiwi",
         stream_data: bool = False,
         stream_port: int = 5556,
@@ -70,25 +68,8 @@ class LeKiwi(Agent):
         self.arms_service.start()
         self.pose_service.start()
 
-        # Optional data streaming (to anyone listening)
-        # TODO: This should probably exist in the pose detection worker thread instead
-        self.stream_data = stream_data
-        self.zmq_pub = None
-        if stream_data:
-            context = zmq.Context()
-            self.zmq_pub = context.socket(zmq.PUB)
-            self.zmq_pub.setsockopt(zmq.CONFLATE, 1)
-            self.zmq_pub.bind(f"tcp://*:{stream_port}")
-            print(f"ZMQ Publisher on LeKiwi bound to port {stream_port}")
-
         # Wake up
         self.arms_service.dispatch("play", "wake_up")
-
-    def _publish_sensor_data(self, data_type: str, data: dict):
-        """Publish sensor data to ZMQ stream if enabled."""
-        if self.zmq_pub:
-            message = {"type": data_type, "timestamp": time.time(), "data": data}
-            self.zmq_pub.send_json(message)
 
     def _handle_pose_status(self, status_type: str, details: dict):
         """
@@ -99,25 +80,7 @@ class LeKiwi(Agent):
             f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
         )
 
-        # Stream pose data if enabled
-        if self.stream_data:
-            self._publish_sensor_data(
-                "pose",
-                {
-                    "status": status_type,
-                    "score": details.get("score", 0.0),
-                    "ratio": details.get("ratio", 0.0),
-                },
-            )
-
         if status_type == "PERSON_FALLEN":
-            # The main thread (LiveKit orchestrator) decides what to do
-            # In an Agent, this often means generating a reply or dispatching a motor action.
-
-            # Example 1: Use the LLM to generate an urgent reply
-            # You would need a mechanism to break into the current LLM flow.
-            # For simplicity, let's dispatch an action for now.
-
             # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
             self.wheels_service.dispatch("play", "spin")
             # log it
@@ -197,7 +160,7 @@ async def entrypoint(ctx: agents.JobContext):
         if arg == "--stream-port" and i + 1 < len(sys.argv):
             stream_port = int(sys.argv[i + 1])
 
-    agent = LeKiwi(stream_data=stream_enabled, stream_port=stream_port)
+    agent = LeTars(stream_data=stream_enabled, stream_port=stream_port)
 
     session = AgentSession(llm=openai.realtime.RealtimeModel(voice="verse"))
 

@@ -22,8 +22,10 @@ from lekiwi.vision import (
 )
 
 
-def annotate_frame(frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict, draw_text=True):
-    """Custom viewer with larger text overlays. Annotates frame in-place."""
+def draw_overlay(
+    frame, result, event, is_fall: bool, fps: float, quality: dict, face_stats: dict
+) -> bool:
+    """Custom viewer with larger text overlays."""
     label = "FALL" if is_fall else "OK"
     color = (0, 0, 255) if is_fall else (0, 200, 0)
     ratio_txt = f"{event.ratio:.2f}" if event else "--"
@@ -140,11 +142,15 @@ def process_pose_stream(video_source=0, draw_text=True):
                 print("Error: Could not read frame from camera")
                 break
 
-            result = pose.infer(frame)
-            landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
+        result = pose.infer(frame)
+        landmarks = (
+            result.pose_landmarks.landmark if result and result.pose_landmarks else None
+        )
 
-            quality = compute_quality_metrics(frame, prev_gray, landmarks, downscale_width=320)
-            prev_gray = quality.pop("gray", None)
+        quality = compute_quality_metrics(
+            frame, prev_gray, landmarks, downscale_width=320
+        )
+        prev_gray = quality.pop("gray", None)
 
             event = None
             is_fall = last_is_fall
@@ -159,18 +165,18 @@ def process_pose_stream(video_source=0, draw_text=True):
             fps = 1.0 / max(now - last_time, 1e-6)
             last_time = now
 
-            face_stats = {
-                'face_status': 'no_face',
-                'hr_method': '',
-            }
-            face_result = face_lm.infer(frame)
-            if face_result.multi_face_landmarks:
-                face_lms = face_result.multi_face_landmarks[0].landmark
-                h, w, _ = frame.shape
-                face_box = compute_face_box(face_lms, w, h)
-                eyes = compute_eye_metrics(face_lms, w, h)
-                awake = blink_awake.update(eyes["ear_mean"], timestamp=now)
-                hr = rppg.update(frame, face_box, timestamp=now)
+        face_stats = {
+            "face_status": "no_face",
+            "hr_method": "",
+        }
+        face_result = face_lm.infer(frame)
+        if face_result.multi_face_landmarks:
+            face_lms = face_result.multi_face_landmarks[0].landmark
+            h, w, _ = frame.shape
+            face_box = compute_face_box(face_lms, w, h)
+            eyes = compute_eye_metrics(face_lms, w, h)
+            awake = blink_awake.update(eyes["ear_mean"], timestamp=now)
+            hr = rppg.update(frame, face_box, timestamp=now)
 
                 face_stats = {
                     **eyes,
@@ -182,29 +188,10 @@ def process_pose_stream(video_source=0, draw_text=True):
                     "hr_method": hr.get("method", ""),
                 }
 
-            annotate_frame(frame, result, event or last_event, is_fall, fps, quality, face_stats, draw_text=draw_text)
-            
-            # Construct a dictionary with all the data for external consumers
-            data_context = {
-                "result": result,
-                "event": event or last_event,
-                "is_fall": is_fall,
-                "fps": fps,
-                "quality": quality,
-                "face_stats": face_stats
-            }
-            
-            yield frame, data_context
-
-    finally:
-        cap.release()
-        pose.close()
-
-
-def main():
-    for frame, _ in process_pose_stream():
-        cv2.imshow("Fall Detection Viewer", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        stop = draw_overlay(
+            frame, result, event or last_event, is_fall, fps, quality, face_stats
+        )
+        if stop:
             break
     cv2.destroyAllWindows()
 

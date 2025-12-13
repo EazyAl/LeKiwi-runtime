@@ -1,5 +1,8 @@
-import logging
 import os
+import sys
+
+import logging
+import asyncio
 from pathlib import Path
 import time
 from typing import Optional, Dict, Any, TYPE_CHECKING
@@ -8,6 +11,25 @@ if TYPE_CHECKING:
     from livekit.agents import AgentSession
 
 from dotenv import load_dotenv
+
+# ---- Logging configuration ----
+# Many dependencies (draccus, gitpython, livekit) can be extremely chatty at DEBUG.
+# Configure logging once, early, and allow override via LOG_LEVEL env var.
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,  # override any handlers configured by imported libs
+)
+# Silence especially noisy loggers by default.
+for _name, _lvl in {
+    "draccus": logging.WARNING,
+    "git": logging.WARNING,
+    "git.cmd": logging.WARNING,
+    "asyncio": logging.INFO,
+    "lekiwi.workflows.workflows": logging.INFO,
+}.items():
+    logging.getLogger(_name).setLevel(_lvl)
 
 logger = logging.getLogger(__name__)
 from livekit import rtc, agents
@@ -23,7 +45,7 @@ from livekit.plugins import (
 )
 
 # LeKiwi robot imports
-from lekiwi.robot.lekiwi import LeKiwi
+from lekiwi.robot import LeKiwi
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 
 # from lekiwi.services import Priority
@@ -90,16 +112,16 @@ def parse_workflow_args():
         return None
 
 
-class LeKiwi(Agent):
+class LeTars(Agent):
     def __init__(
         self,
-        port: str = "/dev/ttyACM0",
+        port: str = "/dev/tty.usbmodem58760432781",
         robot_id: str = "biden_kiwi",
         stream_data: bool = False,
         stream_port: int = 5556,
     ):
         super().__init__(instructions=_load_system_prompt())
-        # Three services running on separate threads, with LeKiwi agent dispatching events to them
+        # Three services running on separate threads, with agent dispatching events to them
         self.wheels_service = WheelsService(port=port, robot_id=robot_id)
         self.arms_service = ArmsService(port=port, robot_id=robot_id)
         camera_stream = CameraStream()
@@ -136,6 +158,8 @@ class LeKiwi(Agent):
         # Session reference for triggering LLM responses (set after session creation)
         # Using _agent_session to avoid conflict with Agent base class's session property
         self._agent_session: Optional["AgentSession"] = None
+        # Filled in after session creation (used by tools)
+        self.current_room_name: Optional[str] = None
 
         # Start robot services
         self.wheels_service.start()
@@ -193,9 +217,8 @@ class LeKiwi(Agent):
             # For simplicity, let's dispatch an action for now.
 
             # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            self.wheels_service.dispatch("play", "spin")
             # log it
-            print(f"LeKiwi: Person fallen detected, dispatching spin action")
+            print(f"LeKiwi: Person fallen detected, dispatching concerned mode")
 
             # Example 3: Log the event for the main LLM loop to pick up (complex, but robust)
             # You might set a flag or put an event in a queue monitored by the agent's reply loop.
@@ -482,7 +505,7 @@ async def entrypoint(ctx: agents.JobContext):
     workflow_names = parse_workflow_args()
 
     # Initialize agent with streaming enabled if requested
-    agent = LeKiwi(stream_data=stream_enabled, stream_port=stream_port)
+    agent = LeTars(stream_data=stream_enabled, stream_port=stream_port)
 
     # Ensure agent instance is set (should already be set in __init__, but double-check)
     if agent.workflow_service.agent_instance is None:

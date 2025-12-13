@@ -1,0 +1,83 @@
+"""
+Standalone viewer for pose detection and fall detection.
+Uses only components from pose_service.py. Uses the default webcam (index 0). Press 'q' to quit.
+"""
+
+import cv2
+import time
+import mediapipe as mp
+
+from lekiwi.services.pose_detection.pose_service import (
+    CameraStream,
+    PoseEstimator,
+    FallDetector,
+    default_visualizer,
+)
+
+
+def main():
+    # Initialize camera and pose detection components
+    camera = CameraStream(index=0)
+    pose_estimator = PoseEstimator()
+    fall_detector = FallDetector()
+
+    # State variables for fall detection
+    last_event = None
+    last_is_fall = False
+
+    try:
+        # Start the camera
+        camera.start()
+        print("Camera started. Press 'q' to quit.")
+
+        prev_time = time.time()
+
+        while True:
+            # Read frame from camera
+            frame = camera.read()
+
+            # Perform pose estimation
+            result = pose_estimator.infer(frame)
+            landmarks = (
+                result.pose_landmarks.landmark
+                if result and result.pose_landmarks
+                else None
+            )
+
+            # Perform fall detection if landmarks are available
+            event = None
+            is_fall = last_is_fall
+            if landmarks:
+                event = fall_detector.detect(landmarks)
+                if event:
+                    is_fall = event.is_fall
+                    last_event = event
+                    last_is_fall = is_fall
+
+            # Calculate FPS
+            now = time.time()
+            fps = 1.0 / max(now - prev_time, 1e-6)
+            prev_time = now
+
+            # Use the default visualizer to display results
+            should_stop = default_visualizer(
+                frame, result, event or last_event, is_fall, fps
+            )
+
+            if should_stop:
+                break
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        # Clean up resources
+        camera.stop()
+        pose_estimator.close()
+        cv2.destroyAllWindows()
+        print("Resources cleaned up")
+
+
+if __name__ == "__main__":
+    main()
