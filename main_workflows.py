@@ -22,15 +22,21 @@ from livekit.plugins import (
     noise_cancellation,
 )
 
+# LeKiwi robot imports
+from lekiwi.robot.lekiwi import LeKiwi
+from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
+
 # from lekiwi.services import Priority
-# from lekiwi.services.motors import ArmsService, WheelsService
-# from lekiwi.services.pose_detection import (
-#     PoseDetectionService,
-#     CameraStream,
-#     PoseEstimator,
-#     FallDetector,
-# )
+from lekiwi.services.motors.arms_service import ArmsService
+from lekiwi.services.motors.wheels_service import WheelsService
+from lekiwi.services.pose_detection.pose_service import (
+    PoseDetectionService,
+    CameraStream,
+    PoseEstimator,
+    FallDetector,
+)
 from lekiwi.workflows.workflows import WorkflowService
+from lekiwi.services.navigation import Navigator
 
 # import zmq
 
@@ -94,18 +100,30 @@ class LeKiwi(Agent):
     ):
         super().__init__(instructions=_load_system_prompt())
         # Three services running on separate threads, with LeKiwi agent dispatching events to them
-        # COMMENTED OUT FOR VOICE-ONLY TESTING
-        # self.wheels_service = WheelsService(port=port, robot_id=robot_id)
-        # self.arms_service = ArmsService(port=port, robot_id=robot_id)
-        # camera_stream = CameraStream()
-        # pose_estimator = PoseEstimator()
-        # fall_detector = FallDetector()
-        # self.pose_service = PoseDetectionService(
-        #     camera=camera_stream,
-        #     pose=pose_estimator,
-        #     detector=fall_detector,
-        #     status_callback=self._handle_pose_status,  # callback method
-        # )
+        self.wheels_service = WheelsService(port=port, robot_id=robot_id)
+        self.arms_service = ArmsService(port=port, robot_id=robot_id)
+        camera_stream = CameraStream()
+        pose_estimator = PoseEstimator()
+        fall_detector = FallDetector()
+        self.pose_service = PoseDetectionService(
+            camera=camera_stream,
+            pose=pose_estimator,
+            detector=fall_detector,
+            status_callback=self._handle_pose_status,  # callback method
+        )
+
+        # Initialize robot connection
+        self.robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
+        self.robot = LeKiwi(self.robot_config)
+        self.robot.connect()
+
+        # Initialize navigator with robot instance
+        self.navigator = Navigator(self.robot)
+
+        # Initialize epipen service with robot instance
+        from lekiwi.services.epipen import EpipenService
+
+        self.epipen_service = EpipenService(self.robot)
 
         # Initialize workflow service
         self.workflow_service = WorkflowService()
@@ -119,129 +137,127 @@ class LeKiwi(Agent):
         # Using _agent_session to avoid conflict with Agent base class's session property
         self._agent_session: Optional["AgentSession"] = None
 
-        # COMMENTED OUT FOR VOICE-ONLY TESTING
-        # self.wheels_service.start()
-        # self.arms_service.start()
-        # self.pose_service.start()
+        # Start robot services
+        self.wheels_service.start()
+        self.arms_service.start()
+        self.pose_service.start()
 
         # Optional data streaming (to anyone listening)
         # TODO: This should probably exist in the pose detection worker thread instead
-        # COMMENTED OUT FOR VOICE-ONLY TESTING
-        # self.stream_data = stream_data
-        # self.zmq_pub = None
-        # if stream_data:
-        #     context = zmq.Context()
-        #     self.zmq_pub = context.socket(zmq.PUB)
-        #     self.zmq_pub.setsockopt(zmq.CONFLATE, 1)
-        #     self.zmq_pub.bind(f"tcp://*:{stream_port}")
-        #     print(f"ZMQ Publisher on LeKiwi bound to port {stream_port}")
+        self.stream_data = stream_data
+        self.zmq_pub = None
+        if stream_data:
+            import zmq
 
-        # Wake up
-        # COMMENTED OUT FOR VOICE-ONLY TESTING
-        # self.arms_service.dispatch("play", "wake_up")
+            context = zmq.Context()
+            self.zmq_pub = context.socket(zmq.PUB)
+            self.zmq_pub.setsockopt(zmq.CONFLATE, 1)
+            self.zmq_pub.bind(f"tcp://*:{stream_port}")
+            print(f"ZMQ Publisher on LeKiwi bound to port {stream_port}")
 
-    # COMMENTED OUT FOR VOICE-ONLY TESTING
-    # def _publish_sensor_data(self, data_type: str, data: dict):
-    #     """Publish sensor data to ZMQ stream if enabled."""
-    #     if self.zmq_pub:
-    #         message = {"type": data_type, "timestamp": time.time(), "data": data}
-    #         self.zmq_pub.send_json(message)
+        # Wake up animation
+        self.arms_service.dispatch("play", "wake_up")
 
-    # def _handle_pose_status(self, status_type: str, details: dict):
-    #     """
-    #     Callback method to receive status updates from the PoseDetectionService.
-    #     This runs in the context of the service's worker thread, but is called by it.
-    #     """
-    #     print(
-    #         f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
-    #     )
+    def _publish_sensor_data(self, data_type: str, data: dict):
+        """Publish sensor data to ZMQ stream if enabled."""
+        if self.zmq_pub:
+            message = {"type": data_type, "timestamp": time.time(), "data": data}
+            self.zmq_pub.send_json(message)
 
-    #     # Stream pose data if enabled
-    #     if self.stream_data:
-    #         self._publish_sensor_data(
-    #             "pose",
-    #             {
-    #                 "status": status_type,
-    #                 "score": details.get("score", 0.0),
-    #                 "ratio": details.get("ratio", 0.0),
-    #             },
-    #         )
+    def _handle_pose_status(self, status_type: str, details: dict):
+        """
+        Callback method to receive status updates from the PoseDetectionService.
+        This runs in the context of the service's worker thread, but is called by it.
+        """
+        print(
+            f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
+        )
 
-    #     if status_type == "PERSON_FALLEN":
-    #         # The main thread (LiveKit orchestrator) decides what to do
-    #         # In an Agent, this often means generating a reply or dispatching a motor action.
+        # Stream pose data if enabled
+        if self.stream_data:
+            self._publish_sensor_data(
+                "pose",
+                {
+                    "status": status_type,
+                    "score": details.get("score", 0.0),
+                    "ratio": details.get("ratio", 0.0),
+                },
+            )
 
-    #         # Example 1: Use the LLM to generate an urgent reply
-    #         # You would need a mechanism to break into the current LLM flow.
-    #         # For simplicity, let's dispatch an action for now.
+        if status_type == "PERSON_FALLEN":
+            # The main thread (LiveKit orchestrator) decides what to do
+            # In an Agent, this often means generating a reply or dispatching a motor action.
 
-    #         # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-    #         self.wheels_service.dispatch("play", "spin")
-    #         # log it
-    #         print(f"LeKiwi: Person fallen detected, dispatching spin action")
+            # Example 1: Use the LLM to generate an urgent reply
+            # You would need a mechanism to break into the current LLM flow.
+            # For simplicity, let's dispatch an action for now.
 
-    #         # Example 3: Log the event for the main LLM loop to pick up (complex, but robust)
-    #         # You might set a flag or put an event in a queue monitored by the agent's reply loop.
-    #         pass
+            # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
+            self.wheels_service.dispatch("play", "spin")
+            # log it
+            print(f"LeKiwi: Person fallen detected, dispatching spin action")
 
-    # COMMENTED OUT FOR VOICE-ONLY TESTING
-    # @function_tool
-    # async def get_available_recordings(self) -> str:
-    #     """
-    #     Discover your physical expressions! Get your repertoire of motor movements for body language.
-    #     Use this when you're curious about what physical expressions you can perform, or when someone
-    #     asks about your capabilities. Each recording is a choreographed movement that shows personality -
-    #     like head tilts, nods, excitement wiggles, or confused gestures. Check this regularly to remind
-    #     yourself of your expressive range!
+            # Example 3: Log the event for the main LLM loop to pick up (complex, but robust)
+            # You might set a flag or put an event in a queue monitored by the agent's reply loop.
+            pass
 
-    #     Returns:
-    #         List of available physical expression recordings you can perform.
-    #     """
-    #     print("LeKiwi: get_available_recordings function called")
-    #     try:
-    #         recordings = self.arms_service.get_available_recordings()
+    @function_tool
+    async def get_available_recordings(self) -> str:
+        """
+        Discover your physical expressions! Get your repertoire of motor movements for body language.
+        Use this when you're curious about what physical expressions you can perform, or when someone
+        asks about your capabilities. Each recording is a choreographed movement that shows personality -
+        like head tilts, nods, excitement wiggles, or confused gestures. Check this regularly to remind
+        yourself of your expressive range!
 
-    #         if recordings:
-    #             result = f"Available recordings: {', '.join(recordings)}"
-    #             return result
-    #         else:
-    #             result = "No recordings found."
-    #             return result
-    #     except Exception as e:
-    #         result = f"Error getting recordings: {str(e)}"
-    #         return result
+        Returns:
+            List of available physical expression recordings you can perform.
+        """
+        print("LeKiwi: get_available_recordings function called")
+        try:
+            recordings = self.arms_service.get_available_recordings()
 
-    # @function_tool
-    # async def play_recording(self, recording_name: str) -> str:
-    #     """
-    #     Express yourself through physical movement! Use this constantly to show personality and emotion.
-    #     Perfect for: greeting gestures, excited bounces, confused head tilts, thoughtful nods,
-    #     celebratory wiggles, disappointed slouches, or any emotional response that needs body language.
-    #     Combine with RGB colors for maximum expressiveness! Your movements are like a dog wagging its tail -
-    #     use them frequently to show you're alive, engaged, and have personality. Don't just talk, MOVE!
+            if recordings:
+                result = f"Available recordings: {', '.join(recordings)}"
+                return result
+            else:
+                result = "No recordings found."
+                return result
+        except Exception as e:
+            result = f"Error getting recordings: {str(e)}"
+            return result
 
-    #     Args:
-    #         recording_name: Name of the physical expression to perform (use get_available_recordings first)
-    #     """
-    #     print(
-    #         f"LeKiwi: play_recording function called with recording_name: {recording_name}"
-    #     )
-    #     try:
-    #         # Send play event to animation service
-    #         self.arms_service.dispatch("play", recording_name)
-    #         result = f"Started playing recording: {recording_name}"
-    #         return result
-    #     except Exception as e:
-    #         result = f"Error playing recording {recording_name}: {str(e)}"
-    #         return result
+    @function_tool
+    async def play_recording(self, recording_name: str) -> str:
+        """
+        Express yourself through physical movement! Use this constantly to show personality and emotion.
+        Perfect for: greeting gestures, excited bounces, confused head tilts, thoughtful nods,
+        celebratory wiggles, disappointed slouches, or any emotional response that needs body language.
+        Combine with RGB colors for maximum expressiveness! Your movements are like a dog wagging its tail -
+        use them frequently to show you're alive, engaged, and have personality. Don't just talk, MOVE!
 
-    # @function_tool
-    # async def get_configuration(self) -> str:
-    #     """
-    #     Get the status of the robot.
-    #     """
-    #     # TODO: Implement this with proper configuration checking and return as json () - see https://github.com/TARS-AI-Community/TARS-AI/blob/V2/src/character/TARS/persona.ini
-    #     return "Status: Nominal"
+        Args:
+            recording_name: Name of the physical expression to perform (use get_available_recordings first)
+        """
+        print(
+            f"LeKiwi: play_recording function called with recording_name: {recording_name}"
+        )
+        try:
+            # Send play event to animation service
+            self.arms_service.dispatch("play", recording_name)
+            result = f"Started playing recording: {recording_name}"
+            return result
+        except Exception as e:
+            result = f"Error playing recording {recording_name}: {str(e)}"
+            return result
+
+    @function_tool
+    async def get_configuration(self) -> str:
+        """
+        Get the status of the robot.
+        """
+        # TODO: Implement this with proper configuration checking and return as json () - see https://github.com/TARS-AI-Community/TARS-AI/blob/V2/src/character/TARS/persona.ini
+        return "Status: Nominal"
 
     @function_tool
     async def toggle_state(self, mode: str) -> str:
@@ -454,20 +470,19 @@ class LeKiwi(Agent):
 # Entry to the agent
 async def entrypoint(ctx: agents.JobContext):
     # Parse command-line args to get stream settings
-    # COMMENTED OUT FOR VOICE-ONLY TESTING
-    # import sys
+    import sys
 
-    # stream_enabled = "--stream" in sys.argv
-    # stream_port = 5556
-    # for i, arg in enumerate(sys.argv):
-    #     if arg == "--stream-port" and i + 1 < len(sys.argv):
-    #         stream_port = int(sys.argv[i + 1])
+    stream_enabled = "--stream" in sys.argv
+    stream_port = 5556
+    for i, arg in enumerate(sys.argv):
+        if arg == "--stream-port" and i + 1 < len(sys.argv):
+            stream_port = int(sys.argv[i + 1])
 
     # Parse which workflows to preload
     workflow_names = parse_workflow_args()
 
-    # COMMENTED OUT FOR VOICE-ONLY TESTING - stream_data and stream_port disabled
-    agent = LeKiwi(stream_data=False, stream_port=5556)
+    # Initialize agent with streaming enabled if requested
+    agent = LeKiwi(stream_data=stream_enabled, stream_port=stream_port)
 
     # Ensure agent instance is set (should already be set in __init__, but double-check)
     if agent.workflow_service.agent_instance is None:
