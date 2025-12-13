@@ -41,6 +41,7 @@ class CameraStream:
         ok, frame = self.cap.read()
         if not ok:
             raise RuntimeError("Frame grab failed")
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
         return frame
 
     def stop(self) -> None:
@@ -122,6 +123,8 @@ class PoseDetectionService(ServiceBase):
         visualizer: Optional[VisualizerFn] = None,
         target_width: Optional[int] = None,
         frame_skip: int = 1,
+        stream_frames: bool = False,
+        stream_port: int = 5557,
     ) -> None:
         super().__init__("pose_detection")
 
@@ -133,6 +136,11 @@ class PoseDetectionService(ServiceBase):
         self.visualizer = visualizer
         self.ring_buffer = FrameRingBuffer(max_seconds=10.0, maxlen=300)
         self._prev_gray = None
+
+        # Frame streaming via ZMQ
+        self.stream_frames = stream_frames
+        self.stream_port = stream_port
+        self._zmq_socket = None
 
         # State and configuration
         self.prev_is_fall_state = False  # Replaces self.prev_state
@@ -167,7 +175,7 @@ class PoseDetectionService(ServiceBase):
 
     # 1. Override start() to initialize resources
     def start(self):
-        """Starts camera and worker thread."""
+        """Starts camera and worker thread. ZMQ socket is created in worker thread."""
         try:
             self.camera.start()
         except RuntimeError as e:
@@ -179,16 +187,28 @@ class PoseDetectionService(ServiceBase):
 
     # 2. Override stop() to clean up resources
     def stop(self, timeout: float = 5.0):
-        """Stops worker thread, camera, and pose model."""
+        """Stops worker thread, camera, pose model, and ZMQ socket."""
         super().stop(timeout)  # Stop the worker thread first
         self.camera.stop()
         self.pose.close()
+        if self._zmq_socket:
+            self._zmq_socket.close()
+            self._zmq_socket = None
         cv2.destroyAllWindows()
         self.logger.info("Pose Detection Service stopped")
 
     # 3. Implement the continuous detection loop
     def _event_loop(self):
         """Runs the continuous pose detection and event emission."""
+
+        # Initialize ZMQ frame streaming in worker thread (ZMQ sockets must be used in same thread)
+        if self.stream_frames:
+            import zmq
+            context = zmq.Context()
+            self._zmq_socket = context.socket(zmq.PUB)
+            self._zmq_socket.setsockopt(zmq.CONFLATE, 1)
+            self._zmq_socket.bind(f"tcp://*:{self.stream_port}")
+            self.logger.info(f"Pose frame streaming on port {self.stream_port}")
 
         # Initialize internal loop variables upon starting the thread
         self._prev_time = time.time()
@@ -284,6 +304,35 @@ class PoseDetectionService(ServiceBase):
             now = time.time()
             fps = 1.0 / max(now - self._prev_time, 1e-6)
             self._prev_time = now
+
+            # Stream annotated frame via ZMQ if enabled
+            if self._zmq_socket and process_this:
+                try:
+                    # Draw pose overlay on frame copy for streaming
+                    stream_frame = frame.copy()
+                    event_for_stream = event or self._last_fall_event
+                    is_fall_for_stream = is_fall
+                    
+                    label = "FALL" if is_fall_for_stream else "OK"
+                    color = (0, 0, 255) if is_fall_for_stream else (0, 200, 0)
+                    ratio_txt = f"{event_for_stream.ratio:.2f}" if event_for_stream else "--"
+                    
+                    if result and result.pose_landmarks:
+                        mp.solutions.drawing_utils.draw_landmarks(
+                            stream_frame,
+                            result.pose_landmarks,
+                            mp.solutions.pose.POSE_CONNECTIONS,
+                        )
+                    
+                    cv2.putText(stream_frame, label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+                    cv2.putText(stream_frame, f"ratio {ratio_txt}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(stream_frame, f"FPS {fps:.1f}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    
+                    # Encode and send frame
+                    _, jpeg = cv2.imencode('.jpg', stream_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    self._zmq_socket.send(jpeg.tobytes())
+                except Exception as e:
+                    self.logger.debug(f"Frame streaming failed: {e}")
 
             # Visualization (runs on every frame read, regardless of frame_skip)
             event_for_vis = event or self._last_fall_event

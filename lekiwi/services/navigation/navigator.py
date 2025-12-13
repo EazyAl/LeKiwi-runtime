@@ -12,7 +12,7 @@ import mediapipe as mp
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
 
 # Import MonoPilot from combined_viewer
-from combined_viewer import MonoPilot
+from nav.combined_viewer import MonoPilot
 
 # MediaPipe pose landmark indices
 LEFT_HIP = 23

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -8,6 +9,10 @@ if TYPE_CHECKING:
     from livekit.agents import AgentSession
 
 from dotenv import load_dotenv
+
+# Suppress noisy DEBUG logs from third-party libraries
+logging.getLogger("draccus").setLevel(logging.WARNING)
+logging.getLogger("lerobot.motors").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 from livekit import rtc, agents
@@ -23,7 +28,7 @@ from livekit.plugins import (
 )
 
 # LeKiwi robot imports
-from lekiwi.robot.lekiwi import LeKiwi
+from lekiwi.robot.lekiwi import LeKiwi as LeKiwiRobot
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 
 # from lekiwi.services import Priority
@@ -40,7 +45,7 @@ from lekiwi.services.navigation import Navigator
 
 # import zmq
 
-load_dotenv()
+load_dotenv("nano.env")
 
 
 def _load_system_prompt() -> str:
@@ -90,10 +95,10 @@ def parse_workflow_args():
         return None
 
 
-class LeKiwi(Agent):
+class LeKiwiAgent(Agent):
     def __init__(
         self,
-        port: str = "/dev/ttyACM0",
+        port: str = "/dev/tty.usbmodem58760432781",
         robot_id: str = "biden_kiwi",
         stream_data: bool = False,
         stream_port: int = 5556,
@@ -102,7 +107,7 @@ class LeKiwi(Agent):
         # Three services running on separate threads, with LeKiwi agent dispatching events to them
         self.wheels_service = WheelsService(port=port, robot_id=robot_id)
         self.arms_service = ArmsService(port=port, robot_id=robot_id)
-        camera_stream = CameraStream()
+        camera_stream = CameraStream(index=1)  # Camera index for pose detection (bottom camera)
         pose_estimator = PoseEstimator()
         fall_detector = FallDetector()
         self.pose_service = PoseDetectionService(
@@ -110,11 +115,13 @@ class LeKiwi(Agent):
             pose=pose_estimator,
             detector=fall_detector,
             status_callback=self._handle_pose_status,  # callback method
+            stream_frames=True,  # Enable viewing via scripts/view_pose_stream.py
+            stream_port=5557,
         )
 
         # Initialize robot connection
         self.robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
-        self.robot = LeKiwi(self.robot_config)
+        self.robot = LeKiwiRobot(self.robot_config)
         self.robot.connect()
 
         # Initialize navigator with robot instance
@@ -136,6 +143,9 @@ class LeKiwi(Agent):
         # Session reference for triggering LLM responses (set after session creation)
         # Using _agent_session to avoid conflict with Agent base class's session property
         self._agent_session: Optional["AgentSession"] = None
+        
+        # Store reference to main event loop for cross-thread async calls
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Start robot services
         self.wheels_service.start()
@@ -185,21 +195,18 @@ class LeKiwi(Agent):
             )
 
         if status_type == "PERSON_FALLEN":
-            # The main thread (LiveKit orchestrator) decides what to do
-            # In an Agent, this often means generating a reply or dispatching a motor action.
-
-            # Example 1: Use the LLM to generate an urgent reply
-            # You would need a mechanism to break into the current LLM flow.
-            # For simplicity, let's dispatch an action for now.
-
-            # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            self.wheels_service.dispatch("play", "spin")
-            # log it
-            print(f"LeKiwi: Person fallen detected, dispatching spin action")
-
-            # Example 3: Log the event for the main LLM loop to pick up (complex, but robust)
-            # You might set a flag or put an event in a queue monitored by the agent's reply loop.
-            pass
+            # Call toggle_state to switch to concerned mode (which starts help workflow)
+            # Since toggle_state is async and this callback is sync, use the stored main loop
+            import asyncio
+            try:
+                if self._main_loop is not None and self._main_loop.is_running():
+                    # Schedule the coroutine to run in the main event loop
+                    asyncio.run_coroutine_threadsafe(self.toggle_state("concerned"), self._main_loop)
+                    print("LeKiwi: Person fallen detected, scheduled toggle to concerned state")
+                else:
+                    print("LeKiwi: Person fallen detected, but main event loop not available yet")
+            except Exception as e:
+                print(f"LeKiwi: Error toggling to concerned state: {e}")
 
     @function_tool
     async def get_available_recordings(self) -> str:
@@ -482,7 +489,7 @@ async def entrypoint(ctx: agents.JobContext):
     workflow_names = parse_workflow_args()
 
     # Initialize agent with streaming enabled if requested
-    agent = LeKiwi(stream_data=stream_enabled, stream_port=stream_port)
+    agent = LeKiwiAgent(stream_data=stream_enabled, stream_port=stream_port)
 
     # Ensure agent instance is set (should already be set in __init__, but double-check)
     if agent.workflow_service.agent_instance is None:
@@ -504,6 +511,9 @@ async def entrypoint(ctx: agents.JobContext):
         ctx.room, "name", None
     )
     agent._agent_session = session
+    
+    # Store reference to main event loop for cross-thread async calls
+    agent._main_loop = asyncio.get_running_loop()
 
     await session.start(
         room=ctx.room,

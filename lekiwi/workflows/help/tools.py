@@ -47,8 +47,8 @@ def _guard_emergency_only(agent) -> str | None:
 @function_tool
 async def navigate_to_administration_point(self) -> str:
     """
-    Navigate to the epipen administration point. Move the robot to the location
-    where the epipen is stored so it can be administered.
+    Navigate to the epipen administration point. Move the robot to the person
+    who needs the epipen administered.
 
     Returns:
         Confirmation message indicating successful navigation to administration point.
@@ -56,9 +56,15 @@ async def navigate_to_administration_point(self) -> str:
     guard_msg = _guard_emergency_only(self)
     if guard_msg is not None:
         return guard_msg
-    logger.debug("LeKiwi: navigate_to_epipen_location function called")
-    # TODO: Implement actual navigation logic
-    return "Navigated to epipen administration point"
+    logger.debug("LeKiwi: navigate_to_administration_point function called")
+    try:
+        result = self.navigator.navigate_to_person()
+        logger.info(f"LeKiwi: navigate_to_administration_point completed: {result}")
+        return result
+    except Exception as e:
+        error_msg = f"Navigation to administration point failed: {str(e)}"
+        logger.error(f"LeKiwi: {error_msg}")
+        return error_msg
 
 
 # TODO(ALI): replace with working ER call
