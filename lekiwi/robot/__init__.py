@@ -1,4 +1,6 @@
 from .lekiwi import LeKiwi
 
-__all__ = ["LeKiwi"]
+from .arm_adapter import ArmOnlyAdapter
+
+__all__ = ["LeKiwi", "ArmOnlyAdapter"]
 

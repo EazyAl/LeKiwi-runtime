@@ -14,8 +14,10 @@ from lekiwi.robot.lekiwi import LeKiwi
 try:
     from lerobot.policies.act.modeling_act import ACTPolicy
     from lerobot.policies.factory import make_pre_post_processors
-    from lerobot.policies.utils import build_inference_frame, make_robot_action
-    from lerobot.datasets.utils import hw_to_dataset_features
+    from lerobot.policies.utils import make_robot_action
+    from lerobot.datasets.utils import hw_to_dataset_features, build_dataset_frame
+    from lerobot.utils.constants import OBS_STR
+    from lerobot.utils.control_utils import predict_action
 
     LEROBOT_AVAILABLE = True
 except ImportError as e:
@@ -35,7 +37,16 @@ class EpipenService:
     """
 
     def __init__(
-        self, robot: LeKiwi, front_cam_sub=None, wrist_cam_sub=None, policy_path: str = "CRPlab/lekiwi_light_policy_1"
+        self,
+        robot: LeKiwi,
+        front_cam_sub=None,
+        wrist_cam_sub=None,
+        policy_path: str = "CRPlab/letars_test_policy_2",
+        *,
+        arm_only: Optional[bool] = None,
+        output_rgb: bool = True,
+        front_rotate_code: Optional[int] = None,
+        wrist_rotate_code: Optional[int] = None,
     ):
         """
         Initialize epipen service with robot and ACT policy.
@@ -49,6 +60,26 @@ class EpipenService:
         self.robot = robot
         self.front_cam_sub = front_cam_sub
         self.wrist_cam_sub = wrist_cam_sub
+        # If None, we auto-detect from the policy's expected feature shapes.
+        self.arm_only: Optional[bool] = arm_only
+        self.output_rgb = output_rgb
+
+        # Defaults chosen to match LeRobot's official LeKiwi OpenCV camera config:
+        # - front: ROTATE_180
+        # - wrist: ROTATE_90_CLOCKWISE (OpenCV uses clockwise rotation constant)
+        # We keep these configurable because physical camera mounting can differ.
+        try:
+            import cv2  # type: ignore
+
+            self._front_rotate_code = cv2.ROTATE_180 if front_rotate_code is None else front_rotate_code
+            self._wrist_rotate_code = (
+                cv2.ROTATE_90_CLOCKWISE if wrist_rotate_code is None else wrist_rotate_code
+            )
+        except Exception:
+            # If cv2 isn't available at init time, we'll just skip rotation.
+            self._front_rotate_code = front_rotate_code
+            self._wrist_rotate_code = wrist_rotate_code
+
         self.policy = None
         self.preprocess = None
         self.postprocess = None
@@ -70,25 +101,11 @@ class EpipenService:
                     preprocessor_overrides={"device_processor": {"device": str(self.device)}},
                 )
                 
-                # Build dataset features from robot's observation/action features
-                # Filter out base velocity keys - policy was trained with arm only (6 state values)
-                arm_action_features = {k: v for k, v in robot.action_features.items() 
-                                       if k not in ["x.vel", "y.vel", "theta.vel"]}
-                arm_obs_features = {k: v for k, v in robot.observation_features.items() 
-                                    if k not in ["x.vel", "y.vel", "theta.vel"]}
-                
-                # Add camera features for ACT policy (expects front and wrist images)
+                # Build dataset features from robot + cameras (and auto-match policy expected dims)
                 # Image shape: (height, width, channels) -> (480, 640, 3)
                 self._image_height = 480
                 self._image_width = 640
-                camera_obs_features = {
-                    "front": (self._image_height, self._image_width, 3),
-                    "wrist": (self._image_height, self._image_width, 3),
-                }
-                
-                action_features = hw_to_dataset_features(arm_action_features, "action")
-                obs_features = hw_to_dataset_features({**arm_obs_features, **camera_obs_features}, "observation")
-                self.dataset_features = {**action_features, **obs_features}
+                self._rebuild_dataset_features(robot)
                 
                 logger.info(f"ACT policy loaded successfully on device: {self.device}")
             except Exception as e:
@@ -123,6 +140,17 @@ class EpipenService:
             logger.info("Starting epipen administration sequence...")
             print("Starting epipen administration sequence...")
 
+            # Match `lerobot_record` behavior: reset policy + processors at the start of a run
+            try:
+                if hasattr(self.policy, "reset"):
+                    self.policy.reset()
+                if self.preprocess is not None and hasattr(self.preprocess, "reset"):
+                    self.preprocess.reset()
+                if self.postprocess is not None and hasattr(self.postprocess, "reset"):
+                    self.postprocess.reset()
+            except Exception as e:
+                logger.warning(f"Failed to reset policy/processors (continuing): {e}")
+
             start_time = time.time()
             last_inference_time = 0
 
@@ -137,13 +165,15 @@ class EpipenService:
                 last_inference_time = current_time
 
                 try:
-                    # Get current observation from robot (arm state only)
+                    # Get current observation from robot
                     raw_obs = self.robot.get_observation()
                     
-                    # Filter observation to only include arm state (policy trained with 6 arm values, not 9)
-                    # Remove base velocity keys that aren't in the training data
-                    filtered_obs = {k: v for k, v in raw_obs.items() 
-                                   if k not in ["x.vel", "y.vel", "theta.vel"]}
+                    # Optionally filter observation to arm-only (for policies trained without base velocities)
+                    filtered_obs = raw_obs
+                    if self.arm_only is True:
+                        filtered_obs = {
+                            k: v for k, v in raw_obs.items() if k not in ["x.vel", "y.vel", "theta.vel"]
+                        }
                     
                     # Get camera images from subscriptions
                     front_frame = self._get_camera_frame(self.front_cam_sub, "front")
@@ -156,32 +186,45 @@ class EpipenService:
                     # Add camera images to observation
                     filtered_obs["front"] = front_frame
                     filtered_obs["wrist"] = wrist_frame
-                    
-                    # Build inference frame using lerobot's utility
-                    # Signature: build_inference_frame(observation, device, ds_features, task, robot_type)
-                    obs_frame = build_inference_frame(
-                        filtered_obs, 
-                        self.device,
-                        self.dataset_features, 
+
+                    # Build observation frame exactly like `lerobot_record.py` does (numpy dict keyed by
+                    # "observation.state" / "observation.images.*").
+                    observation_frame = build_dataset_frame(self.dataset_features, filtered_obs, prefix=OBS_STR)
+
+                    # Predict action using LeRobot's standard inference helper (handles:
+                    # - image conversion to float32 [0,1] and channel-first
+                    # - adding batch dim
+                    # - adding task/robot_type
+                    # - preprocessor + postprocessor pipelines)
+                    action = predict_action(
+                        observation=observation_frame,
+                        policy=self.policy,
+                        device=self.device,
+                        preprocessor=self.preprocess,
+                        postprocessor=self.postprocess,
+                        use_amp=bool(getattr(self.policy.config, "use_amp", False)),
                         task=self._task_description,
                         robot_type=self._robot_type,
                     )
                     
-                    # Preprocess observation (normalizes inputs)
-                    obs = self.preprocess(obs_frame)
-
-                    # Predict actions using ACT policy
-                    with torch.inference_mode():
-                        action = self.policy.select_action(obs)
-                    
-                    # Postprocess action (unnormalizes outputs)
-                    action = self.postprocess(action)
-                    
                     # Convert to robot action format
                     action_dict = make_robot_action(action, self.dataset_features)
                     
-                    # Execute actions on robot (arm only since policy was trained on arm)
-                    self.robot.send_arm_action(action_dict)
+                    # Execute actions on robot.
+                    # `lerobot_record` uses `robot.send_action(...)` which can include safety clamping and
+                    # base kinematics conversion. Prefer that path when possible.
+                    if hasattr(self.robot, "send_action"):
+                        # If policy is arm-only, LeKiwi.send_action requires base velocities; fill zeros.
+                        if "x.vel" not in action_dict:
+                            action_dict["x.vel"] = 0.0
+                        if "y.vel" not in action_dict:
+                            action_dict["y.vel"] = 0.0
+                        if "theta.vel" not in action_dict:
+                            action_dict["theta.vel"] = 0.0
+                        self.robot.send_action(action_dict)
+                    else:
+                        # Fallback for minimal robot interfaces
+                        self.robot.send_arm_action(action_dict)
 
                     # Check if administration is complete
                     if self._is_epipen_administration_complete():
@@ -252,10 +295,20 @@ class EpipenService:
             if pulled is None:
                 return None
             ts, frame = pulled
-            
-            # Wrist camera is mounted upside down - rotate 180 degrees
-            if cam_name == "wrist":
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+            # CameraHub frames are OpenCV-native (BGR). LeRobot's inference pipeline typically
+            # expects RGB images, so convert here to match `lerobot_record` behavior.
+            if self.output_rgb:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Apply configured rotation (to match how LeRobot's OpenCVCamera does it).
+            rotate_code = None
+            if cam_name == "front":
+                rotate_code = self._front_rotate_code
+            elif cam_name == "wrist":
+                rotate_code = self._wrist_rotate_code
+            if rotate_code is not None:
+                frame = cv2.rotate(frame, rotate_code)
             
             # Ensure frame is the right shape (resize if needed)
             if frame.shape[0] != self._image_height or frame.shape[1] != self._image_width:
@@ -264,6 +317,84 @@ class EpipenService:
         except Exception as e:
             logger.warning(f"Failed to get {cam_name} camera frame: {e}")
             return None
+
+    def _rebuild_dataset_features(self, robot: LeKiwi) -> None:
+        """
+        Build dataset features for inference in a way that matches what the policy expects.
+
+        The most common mismatch (and the one you hit) is a policy trained with 6-D arm-only state,
+        while the LeKiwi robot exposes 9 state dims (arm + base velocities). If `arm_only` is None,
+        we try to infer it from the policy config and automatically filter base velocities.
+        """
+        if not LEROBOT_AVAILABLE:
+            return
+
+        # Decide arm_only if auto
+        if self.arm_only is None:
+            inferred = self._infer_arm_only_from_policy(robot)
+            self.arm_only = inferred
+            logger.info(f"EpipenService arm_only auto-detected as {self.arm_only}")
+
+        action_features_hw = robot.action_features
+        obs_features_hw = robot.observation_features
+        if self.arm_only is True:
+            action_features_hw = {
+                k: v for k, v in action_features_hw.items() if k not in ["x.vel", "y.vel", "theta.vel"]
+            }
+            obs_features_hw = {k: v for k, v in obs_features_hw.items() if k not in ["x.vel", "y.vel", "theta.vel"]}
+
+        camera_obs_features = {
+            "front": (self._image_height, self._image_width, 3),
+            "wrist": (self._image_height, self._image_width, 3),
+        }
+
+        action_features = hw_to_dataset_features(action_features_hw, "action")
+        obs_features = hw_to_dataset_features({**obs_features_hw, **camera_obs_features}, "observation")
+        self.dataset_features = {**action_features, **obs_features}
+
+    def _infer_arm_only_from_policy(self, robot: LeKiwi) -> bool:
+        """
+        Infer whether the policy expects arm-only state/action sizes.
+
+        Falls back to `True` if we can't infer reliably, because most ACT policies trained for
+        manipulation on LeKiwi are arm-only and will crash if provided 9-D state.
+        """
+        try:
+            cfg = getattr(self.policy, "config", None)
+            input_features = getattr(cfg, "input_features", None)
+            output_features = getattr(cfg, "output_features", None)
+
+            # Expected state dimension from policy config (most reliable signal)
+            expected_state_dim = None
+            if isinstance(input_features, dict):
+                ft = input_features.get("observation.state")
+                shape = getattr(ft, "shape", None)
+                if isinstance(shape, (tuple, list)) and len(shape) == 1:
+                    expected_state_dim = int(shape[0])
+
+            # If policy expects fewer state dims than robot exposes, it's arm-only.
+            robot_state_dim = len(robot._state_ft) if hasattr(robot, "_state_ft") else len(
+                [k for k in robot.observation_features if k.endswith(".pos") or k.endswith(".vel")]
+            )
+            if expected_state_dim is not None:
+                return expected_state_dim < robot_state_dim
+
+            # Expected action dim from policy config (secondary signal)
+            expected_action_dim = None
+            if isinstance(output_features, dict):
+                aft = output_features.get("action")
+                ashape = getattr(aft, "shape", None)
+                if isinstance(ashape, (tuple, list)) and len(ashape) == 1:
+                    expected_action_dim = int(ashape[0])
+            if expected_action_dim is not None:
+                robot_action_dim = len(robot.action_features)
+                return expected_action_dim < robot_action_dim
+
+        except Exception as e:
+            logger.warning(f"Could not infer arm_only from policy config: {e}")
+
+        # Safe default: arm-only
+        return True
 
     def is_ready(self) -> bool:
         """

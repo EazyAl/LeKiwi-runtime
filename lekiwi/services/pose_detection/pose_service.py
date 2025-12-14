@@ -65,7 +65,17 @@ class PoseEstimator:
         return self.pose.process(rgb)
 
     def close(self) -> None:
-        self.pose.close()
+        # MediaPipe raises if close() is called twice (internal graph becomes None).
+        # Make this idempotent so orchestrators can safely stop services multiple times.
+        if self.pose is None:
+            return
+        try:
+            self.pose.close()
+        except ValueError:
+            # "Closing SolutionBase._graph which is already None"
+            pass
+        finally:
+            self.pose = None
 
 
 class FallDetector:

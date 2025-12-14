@@ -20,7 +20,7 @@ from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 
 from lekiwi.services.pose_detection.pose_service import PoseDetectionService
 from lekiwi.services.navigation.navigator import Navigator
-from lekiwi.services.epipen.epipen_service import EpipenService
+from lekiwi.services.epipen.lerobot_record_service import LeRobotRecordConfig, LeRobotRecordService
 from lekiwi.vision.camera_hub import CameraHub
 from lekiwi.viz.rerun_viz import create_viz
 
@@ -74,12 +74,13 @@ class Sentry:
         
         # --- Vision Setup ---
         # CameraHub manages the camera devices and distributes frames
-        self.camera_hub = CameraHub(front_index=4, wrist_index=2)
+        self.camera_hub = CameraHub(front_index=4, wrist_index=2, top_index=6)
         
         # --- Visualization Setup ---
         self.viz = create_viz(enable=True, app_id="lekiwi_sentry")
         # Subscribe to wrist camera for visualization
         self.wrist_sub = self.camera_hub.subscribe_wrist(max_queue=2)
+        self.top_sub = self.camera_hub.subscribe_top(max_queue=2)
         
         # --- Services Setup ---
         
@@ -101,11 +102,33 @@ class Sentry:
             viz=self.viz
         )
         
-        # Epipen Service (ACT policy requires camera images)
-        self.epipen_service = EpipenService(
-            robot=self.robot,
-            front_cam_sub=self.camera_hub.subscribe_front(max_queue=1),
-            wrist_cam_sub=self.camera_hub.subscribe_wrist(max_queue=1),
+        # Emergency epipen: run the official LeRobot script as a subprocess.
+        # IMPORTANT: this subprocess will open the serial port + cameras itself, so we must
+        # release our robot connection and stop CameraHub before launching it.
+        self.lerobot_record = LeRobotRecordService(
+            LeRobotRecordConfig(
+                robot_port="/dev/ttyACM0",
+                robot_id="biden_kiwi",
+                front_index_or_path=6,
+                wrist_index_or_path=2,
+                front_width=640,
+                front_height=480,
+                front_fps=30,
+                wrist_width=640,
+                wrist_height=480,
+                wrist_fps=30,
+                wrist_rotation=180,
+                # Base name only; the subprocess runner will append a random suffix each run
+                # so LeRobot writes to a fresh local dataset folder.
+                dataset_repo_id="CRPlab/eval_letars_test_2_3",
+                unique_repo_id=True,
+                dataset_num_episodes=30,
+                dataset_single_task="Grab the epipen from the medpack and administer it in the patient's thigh",
+                display_data=True,
+                resume=False,
+                push_to_hub=False,
+                policy_path="CRPlab/letars_test_policy_2",
+            )
         )
         
         # State management
@@ -241,14 +264,37 @@ class Sentry:
     def _run_emergency(self):
         """Handle emergency: Administer Epipen."""
         logger.error("ENTERING EMERGENCY MODE")
-        
-        # Run Epipen Service
-        # Note: ACT policy might require camera images in observation. 
-        # Since we initialized LeKiwi without cameras, this might fail if the policy is vision-dependent.
-        # Future TODO: Augment observation with CameraHub frames.
-        
-        result = self.epipen_service.administer_epipen()
-        logger.info(f"Epipen Service Result: {result}")
+
+        # Hand off control to LeRobot subprocess: release our resources first.
+        try:
+            self.robot.stop_base()
+        except Exception:
+            pass
+
+        try:
+            self.pose_service.stop()
+        except Exception:
+            pass
+
+        try:
+            self.camera_hub.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.viz:
+                self.viz.close()
+        except Exception:
+            pass
+
+        try:
+            if self.robot.is_connected:
+                self.robot.disconnect()
+        except Exception:
+            pass
+
+        exit_code = self.lerobot_record.run()
+        logger.info(f"LeRobot record subprocess exited with code: {exit_code}")
 
     # --- Audio Helpers ---
     def _play_audio_challenge(self):
