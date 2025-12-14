@@ -12,8 +12,19 @@ import torch
 import numpy as np
 import argparse
 import mediapipe as mp
+import os
 
-# LeKiwi imports
+import logging
+import sys
+from typing import Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 from lekiwi.robot.lekiwi import LeKiwi
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
@@ -121,7 +132,7 @@ def calculate_thigh_offset(thigh_x, frame_width):
     return offset_pixels, normalized_offset
 
 
-def pixels_to_angle(offset_pixels, frame_width, camera_fov_deg=60):
+def pixels_to_angle(offset_pixels, frame_width, camera_fov_deg=20):
     """
     Convert pixel offset to angular offset in degrees.
 
@@ -290,12 +301,12 @@ def main():
     print("Initializing Combined Navigation System...")
 
     # Initialize camera
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(4)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     # Initialize mediapipe pose detection
     pose = PoseEstimator()
-
+ 
     # Initialize MiDaS depth estimation
     print("Initializing MiDaS depth model...")
     mono_pilot = MonoPilot()
@@ -305,35 +316,94 @@ def main():
         config = LeKiwiConfig(port=args.port, id=args.id, cameras={})
         robot = LeKiwi(config)
         robot.connect()
-        print(f"Robot connected successfully on port {args.port}")
+        logger.info(f"Robot connected successfully on port {args.port}")
     except Exception as e:
-        print(f"Failed to connect to robot on port {args.port}: {e}")
-        print("Running in camera-only mode (no robot control)")
+        # `lerobot-find-port` identifies the *device path* by unplug/replug, but
+        # doesn't guarantee this process can open it (permissions/busy port) or
+        # that the controller is responding (protocol/baud).
+        logger.exception(f"Failed to connect to robot on port {args.port}")
+
+        def _find_in_exc_chain(exc: BaseException, predicate) -> Optional[BaseException]:
+            cur: Optional[BaseException] = exc
+            seen: set[int] = set()
+            while cur is not None and id(cur) not in seen:
+                seen.add(id(cur))
+                try:
+                    if predicate(cur):
+                        return cur
+                except Exception:
+                    pass
+                cur = cur.__cause__ or cur.__context__
+            return None
+
+        # Best-effort Linux diagnostics (never crash on non-Linux).
+        try:
+            if os.path.exists(args.port):
+                can_rw = os.access(args.port, os.R_OK | os.W_OK)
+                logger.info(
+                    "Serial device exists: %s (read/write access for current user: %s)",
+                    args.port,
+                    can_rw,
+                )
+                perm = _find_in_exc_chain(
+                    e,
+                    lambda ex: isinstance(ex, PermissionError)
+                    or ("Permission denied" in str(ex))
+                    or (getattr(ex, "errno", None) == 13),
+                )
+                if perm is not None or not can_rw:
+                    logger.info(
+                        "Hint: this looks like a permissions issue opening %s.\n"
+                        "Fix (recommended): add your user to the serial group, then re-login:\n"
+                        "  sudo usermod -aG dialout $USER\n"
+                        "  # log out/in (or reboot)\n"
+                        "Temporary (until unplug/replug):\n"
+                        "  sudo chmod a+rw %s\n"
+                        "If your distro uses a different group, check with:\n"
+                        "  ls -l %s",
+                        args.port,
+                        args.port,
+                        args.port,
+                    )
+            else:
+                logger.info("Serial device path does not exist: %s", args.port)
+        except Exception:
+            pass
+        logger.info("Running in camera-only mode (no robot control)")
         robot = None
 
     # Navigation states
     PHASE_ALIGNMENT = "ALIGNMENT"  # Rotating to face thigh
     PHASE_APPROACH = "APPROACH"  # Driving forward to target
+    PHASE_BACKOFF = "BACKOFF"    # Safety reverse after timeout
     PHASE_COMPLETE = "COMPLETE"  # Finished
 
     current_phase = PHASE_ALIGNMENT
     last_tracked_side = None
+    last_thigh_x = None
+    last_thigh_y = None
     consecutive_below_threshold = 0
     alignment_start_time = time.time()
     alignment_timeout = 10.0  # Give up alignment after 10 seconds
+    
+    # Use monotonic time for safety timers (robust to system clock changes)
+    approach_start_time = None
+    backoff_start_time = None
+    approach_timeout = 8.0 # Max time to drive forward
+    backoff_duration = 1 # Duration to reverse
 
-    print("Starting combined navigation. Press 'q' to quit, 's' to stop immediately.")
+    logger.info("Starting combined navigation. Press 'q' to quit, 's' to stop immediately.")
 
     try:
         while cap.isOpened():
+            now_mono = time.monotonic()
             ok, frame = cap.read()
             if not ok:
                 print("Error: Could not read frame from camera")
                 break
 
-            # Optional camera flip
-            if args.flip:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            # Flip camera frame 180 degrees
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             h, w = frame.shape[:2]
 
@@ -353,13 +423,41 @@ def main():
             # Update tracking continuity
             if side:
                 last_tracked_side = side
+            
+            # Update last known thigh position
+            if thigh_x is not None and thigh_y is not None:
+                last_thigh_x = thigh_x
+                last_thigh_y = thigh_y
 
             # Get depth information for distance measurement
             vx, vy, omega, depth_map, scores = mono_pilot.process_frame(frame)
 
             # Calculate center distance
             center_depth = get_center_distance(depth_map)
-            mode_depth = get_mode_distance(depth_map)
+            
+            # Use the average depth of the 10 pixels surrounding the thigh midpoint
+            target_depth = 0.0
+            
+            # Determine which coordinates to use: current or last known
+            use_x, use_y = None, None
+            if thigh_x is not None and thigh_y is not None:
+                use_x, use_y = thigh_x, thigh_y
+            elif current_phase == PHASE_APPROACH and last_thigh_x is not None and last_thigh_y is not None:
+                # Fallback to last known position during approach
+                use_x, use_y = last_thigh_x, last_thigh_y
+                logger.debug(f"Lost thigh detection, using last known pos: ({use_x:.1f}, {use_y:.1f})")
+
+            if use_x is not None and use_y is not None:
+                # Defined as a 10x10 region (+/- 5 pixels) around the point
+                tx, ty = int(use_x), int(use_y)
+                y_min, y_max = max(0, ty - 5), min(h, ty + 5)
+                x_min, x_max = max(0, tx - 5), min(w, tx + 5)
+                
+                region = depth_map[y_min:y_max, x_min:x_max]
+                if region.size > 0:
+                    target_depth = np.mean(region)
+            
+            mode_depth = target_depth
             estimated_distance = estimate_distance_from_depth(center_depth)
             mode_distance = estimate_distance_from_depth(mode_depth)
 
@@ -378,6 +476,9 @@ def main():
                         if abs(normalized_offset) > args.rotation_deadzone:
                             rotation_speed = -rotation_angle * args.rotation_kp
                             rotation_speed = np.clip(rotation_speed, -20.0, 20.0)
+                            
+                            logger.debug(f"Aligning: Offset={normalized_offset:.3f}, CmdRot={rotation_speed:.1f}")
+                            
                             robot_command = {
                                 "x.vel": 0.0,
                                 "y.vel": 0.0,
@@ -385,45 +486,75 @@ def main():
                             }
                         else:
                             # Aligned! Switch to approach phase
-                            print(f"Alignment complete! Switching to approach phase.")
+                            logger.info(f"Alignment complete! Switching to approach phase. Offset={normalized_offset:.3f}")
                             current_phase = PHASE_APPROACH
+                            approach_start_time = now_mono
                     elif time.time() - alignment_start_time > alignment_timeout:
                         # Timeout - no person detected, give up
-                        print(
+                        logger.warning(
                             f"Alignment timeout ({alignment_timeout}s) - no person detected"
                         )
                         current_phase = PHASE_COMPLETE
 
                 elif current_phase == PHASE_APPROACH:
+                    # If we somehow entered APPROACH without a start time, set it.
+                    if approach_start_time is None:
+                        approach_start_time = now_mono
+
+                    # Check for timeout
+                    if (now_mono - approach_start_time) > approach_timeout:
+                        logger.warning(f"Approach timeout ({approach_timeout}s) reached! Initiating safety backoff.")
+                        current_phase = PHASE_BACKOFF
+                        backoff_start_time = now_mono
+                    
                     # Phase 2: Drive forward to target distance
-                    if mode_distance < 60.0:
+                    elif mode_distance < 20.0:
                         consecutive_below_threshold += 1
-                        print(
+                        logger.debug(
                             f"Close distance detected ({mode_distance:.1f}cm) - {consecutive_below_threshold}/{args.consecutive_frames} frames"
                         )
                     else:
                         consecutive_below_threshold = 0  # Reset counter
 
                     # Stop only after consecutive frames below threshold
-                    if consecutive_below_threshold >= args.consecutive_frames:
-                        print(
-                            f"Target reached at {mode_distance:.1f}cm after {consecutive_below_threshold} consecutive frames"
-                        )
-                        robot_command = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-                        current_phase = PHASE_COMPLETE
-                    else:
-                        # Continue driving forward
+                    if current_phase == PHASE_APPROACH: # Check again in case timeout happened
+                        if consecutive_below_threshold >= args.consecutive_frames:
+                            logger.info(
+                                f"Target reached at {mode_distance:.1f}cm after {consecutive_below_threshold} consecutive frames"
+                            )
+                            robot_command = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+                            current_phase = PHASE_COMPLETE
+                        else:
+                            # Continue driving forward
+                            robot_command = {
+                                "x.vel": args.drive_speed,
+                                "y.vel": 0.0,
+                                "theta.vel": 0.0,
+                            }
+                
+                elif current_phase == PHASE_BACKOFF:
+                    if backoff_start_time is None:
+                        backoff_start_time = now_mono
+
+                    if (now_mono - backoff_start_time) < backoff_duration:
+                        # Drive backwards
                         robot_command = {
-                            "x.vel": args.drive_speed,
+                            "x.vel": -args.drive_speed, # Negative speed
                             "y.vel": 0.0,
                             "theta.vel": 0.0,
                         }
+                    else:
+                        logger.info("Safety backoff complete. Navigation finished.")
+                        robot_command = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+                        current_phase = PHASE_COMPLETE
 
                 # Send command to robot
                 try:
+                    # Always send the latest command (including STOP) so the robot doesn't
+                    # keep executing a stale command when we enter COMPLETE.
                     robot.send_base_action(robot_command)
                 except Exception as e:
-                    print(f"Error sending robot command: {e}")
+                    logger.error(f"Error sending robot command: {e}")
 
             # Visualization
             vis_frame = frame.copy()
@@ -456,38 +587,69 @@ def main():
                 2,
             )
 
-            # Draw thigh midpoint if detected
-            if thigh_x is not None and thigh_y is not None:
+            # Draw thigh midpoint if detected (or fallback in approach phase)
+            draw_x, draw_y = thigh_x, thigh_y
+            is_fallback = False
+            
+            if draw_x is None and current_phase == PHASE_APPROACH and last_thigh_x is not None:
+                draw_x, draw_y = last_thigh_x, last_thigh_y
+                is_fallback = True
+
+            if draw_x is not None and draw_y is not None:
+                # Draw depth sampling region (10x10)
+                tx, ty = int(draw_x), int(draw_y)
+                box_color = (0, 0, 255) if not is_fallback else (0, 165, 255) # Red normally, Orange if fallback
+                
+                cv2.rectangle(
+                    vis_frame,
+                    (tx - 5, ty - 5),
+                    (tx + 5, ty + 5),
+                    box_color,
+                    2,
+                )
+                cv2.rectangle(
+                    depth_color,
+                    (tx - 5, ty - 5),
+                    (tx + 5, ty + 5),
+                    box_color,
+                    2,
+                )
+
                 # Draw midpoint
-                cv2.circle(vis_frame, (int(thigh_x), int(thigh_y)), 8, (0, 255, 0), -1)
+                cv2.circle(vis_frame, (int(draw_x), int(draw_y)), 8, (0, 255, 0), -1)
 
-                # Draw line from hip to knee
-                if side == "left" and landmarks:
-                    hip_x_pos = landmarks[LEFT_HIP].x * w
-                    hip_y_pos = landmarks[LEFT_HIP].y * h
-                    knee_x_pos = landmarks[LEFT_KNEE].x * w
-                    knee_y_pos = landmarks[LEFT_KNEE].y * h
+                if is_fallback:
+                    cv2.putText(vis_frame, "LOST TRACK - USING LAST POS", (tx + 10, ty), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                
+                # Draw line from hip to knee (only if real detection)
+                if not is_fallback and thigh_x is not None:
+                    if side == "left" and landmarks:
+                        hip_x_pos = landmarks[LEFT_HIP].x * w
+                        hip_y_pos = landmarks[LEFT_HIP].y * h
+                        knee_x_pos = landmarks[LEFT_KNEE].x * w
+                        knee_y_pos = landmarks[LEFT_KNEE].y * h
 
-                    cv2.line(
-                        vis_frame,
-                        (int(hip_x_pos), int(hip_y_pos)),
-                        (int(knee_x_pos), int(knee_y_pos)),
-                        (255, 0, 0),
-                        3,
-                    )
-                elif side == "right" and landmarks:
-                    hip_x_pos = landmarks[RIGHT_HIP].x * w
-                    hip_y_pos = landmarks[RIGHT_HIP].y * h
-                    knee_x_pos = landmarks[RIGHT_KNEE].x * w
-                    knee_y_pos = landmarks[RIGHT_KNEE].y * h
+                        cv2.line(
+                            vis_frame,
+                            (int(hip_x_pos), int(hip_y_pos)),
+                            (int(knee_x_pos), int(knee_y_pos)),
+                            (255, 0, 0),
+                            3,
+                        )
+                    elif side == "right" and landmarks:
+                        hip_x_pos = landmarks[RIGHT_HIP].x * w
+                        hip_y_pos = landmarks[RIGHT_HIP].y * h
+                        knee_x_pos = landmarks[RIGHT_KNEE].x * w
+                        knee_y_pos = landmarks[RIGHT_KNEE].y * h
 
-                    cv2.line(
-                        vis_frame,
-                        (int(hip_x_pos), int(hip_y_pos)),
-                        (int(knee_x_pos), int(knee_y_pos)),
-                        (255, 0, 0),
-                        3,
-                    )
+                        cv2.line(
+                            vis_frame,
+                            (int(hip_x_pos), int(hip_y_pos)),
+                            (int(knee_x_pos), int(knee_y_pos)),
+                            (255, 0, 0),
+                            3,
+                        )
 
                 # Draw center line and offset
                 frame_center_x = w // 2
@@ -502,8 +664,8 @@ def main():
                 # Offset line from center to thigh midpoint
                 cv2.line(
                     vis_frame,
-                    (frame_center_x, int(thigh_y)),
-                    (int(thigh_x), int(thigh_y)),
+                    (frame_center_x, int(draw_y)),
+                    (int(draw_x), int(draw_y)),
                     (0, 255, 255),
                     2,
                 )
@@ -511,7 +673,7 @@ def main():
             # Add distance overlay on depth map
             cv2.putText(
                 depth_color,
-                f"Mode: {mode_distance:.1f}cm",
+                f"Thigh: {mode_distance:.1f}cm",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -521,7 +683,7 @@ def main():
             cv2.putText(
                 depth_color,
                 f"Avg: {estimated_distance:.1f}cm",
-                (10, 60),
+                (10, 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
                 (200, 200, 200),
@@ -544,6 +706,7 @@ def main():
                 phase_status = {
                     PHASE_ALIGNMENT: f"ALIGNING ({last_tracked_side or 'None'})",
                     PHASE_APPROACH: "APPROACHING",
+                    PHASE_BACKOFF: "SAFETY BACKOFF",
                     PHASE_COMPLETE: "COMPLETE",
                 }[current_phase]
 
@@ -578,7 +741,7 @@ def main():
             if key == ord("q"):
                 break
             elif not args.calibrate and key == ord("s"):
-                print("Emergency stop requested")
+                logger.info("Emergency stop requested")
                 if robot:
                     robot.stop_base()
                 current_phase = PHASE_COMPLETE
@@ -586,7 +749,7 @@ def main():
 
             # Exit if phase is complete
             if current_phase == PHASE_COMPLETE and not args.calibrate:
-                print("Navigation complete! Press 'q' to exit.")
+                logger.info("Navigation complete! Press 'q' to exit.")
                 # Keep running to show final status
 
     finally:

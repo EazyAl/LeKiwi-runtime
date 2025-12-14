@@ -49,7 +49,7 @@ from lekiwi.viz.rerun_viz import create_viz, NullViz
 load_dotenv()
 
 _RUN_ARGS = {
-    "front_idx": 0,
+    "front_idx": 4,
     "wrist_idx": 2,
     "viz_enabled": False,
 }
@@ -74,10 +74,10 @@ def _load_system_prompt() -> str:
 class LeTars(Agent):
     def __init__(
         self,
-        port: str = "/dev/tty.usbmodem58760432781",
+        port: str = "/dev/ttyACM0",
         robot_id: str = "biden_kiwi",
         viz_enabled: bool = False,
-        front_camera_index: int = 0,
+        front_camera_index: int = 4,
         wrist_camera_index: int = 2,
     ):
         super().__init__(instructions=_load_system_prompt())
@@ -91,17 +91,44 @@ class LeTars(Agent):
         # Initialize single shared robot connection
         from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
+        # Some V4L2 drivers report a different FPS than requested, and lerobot's
+        # OpenCVCamera validation is strict. Allow overriding from env without
+        # changing code.
+        camera_fps = int(os.getenv("LEKIWI_CAMERA_FPS", "30"))
+        camera_fourcc = os.getenv("LEKIWI_CAMERA_FOURCC", "").strip() or None
+        if camera_fourcc is not None and len(camera_fourcc) != 4:
+            logger.warning(
+                f"LEKIWI_CAMERA_FOURCC must be 4 chars (e.g. MJPG), got {camera_fourcc!r}; ignoring."
+            )
+            camera_fourcc = None
+
+        # Avoid double-opening the same cameras when viz is enabled.
+        # CameraHub owns the OpenCV cameras; the robot connection is only for motors in this runtime.
+        use_robot_cameras = (not viz_enabled) and (os.getenv("LEKIWI_ROBOT_USE_CAMERAS", "0") == "1")
+
         self.robot_config = LeKiwiConfig(
             port=port,
             id=robot_id,
-            cameras={
-                "front": OpenCVCameraConfig(
-                    index_or_path=0, width=1280, height=720, fps=30
-                ),
-                "wrist": OpenCVCameraConfig(
-                    index_or_path=1, width=1280, height=720, fps=30
-                ),
-            },
+            cameras=(
+                {
+                    "front": OpenCVCameraConfig(
+                        index_or_path=int(front_camera_index),
+                        width=1280,
+                        height=720,
+                        fps=camera_fps,
+                        fourcc=camera_fourcc,
+                    ),
+                    "wrist": OpenCVCameraConfig(
+                        index_or_path=int(wrist_camera_index),
+                        width=1280,
+                        height=720,
+                        fps=camera_fps,
+                        fourcc=camera_fourcc,
+                    ),
+                }
+                if use_robot_cameras
+                else {}
+            ),
         )
         self.robot = LeKiwi(self.robot_config)
         self.robot.connect(calibrate=False)
@@ -120,7 +147,7 @@ class LeTars(Agent):
             self.camera_hub = CameraHub(
                 front_index=front_camera_index,
                 wrist_index=wrist_camera_index,
-                fps=30,
+                fps=camera_fps,
             )
             self.camera_hub.start()
             self.front_sub_pose = self.camera_hub.subscribe_front(max_queue=2)
@@ -552,6 +579,71 @@ if __name__ == "__main__":
     # Run with: python main_workflows.py dev
     import argparse
 
+    # LiveKit's built-in `console` mode defaults to audio and imports `sounddevice`,
+    # which requires the system PortAudio library. On machines without PortAudio,
+    # the console crashes before you can switch to text mode. Monkeypatch in a
+    # best-effort fallback to text-only.
+    def _patch_livekit_console_text_fallback() -> None:
+        try:
+            from livekit.agents.voice.chat_cli import ChatCLI  # type: ignore
+        except Exception:
+            return
+
+        orig_mic = getattr(ChatCLI, "_update_microphone", None)
+        orig_spk = getattr(ChatCLI, "_update_speaker", None)
+        if not callable(orig_mic) or not callable(orig_spk):
+            return
+
+        def _force_text_mode(self) -> None:  # type: ignore[no-redef]
+            try:
+                self._cli_mode = "text"
+                # Enable text output to stdout
+                self._update_text_output(enable=True, stdout_enable=True)
+                # Ensure no audio I/O is wired
+                try:
+                    self._session.input.audio = None
+                except Exception:
+                    pass
+                try:
+                    self._session.output.audio = None
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        def safe_update_microphone(self, *, enable: bool) -> None:  # type: ignore[no-redef]
+            # Allow forcing text-only via env
+            if os.getenv("LEKIWI_CONSOLE_TEXT_ONLY", "0") == "1":
+                _force_text_mode(self)
+                return
+            try:
+                return orig_mic(self, enable=enable)
+            except OSError as e:
+                # Common: "PortAudio library not found"
+                logger.warning(f"LiveKit console: microphone disabled ({e})")
+                _force_text_mode(self)
+            except Exception as e:
+                logger.warning(f"LiveKit console: microphone disabled ({e})")
+                _force_text_mode(self)
+
+        def safe_update_speaker(self, *, enable: bool) -> None:  # type: ignore[no-redef]
+            if os.getenv("LEKIWI_CONSOLE_TEXT_ONLY", "0") == "1":
+                _force_text_mode(self)
+                return
+            try:
+                return orig_spk(self, enable=enable)
+            except OSError as e:
+                logger.warning(f"LiveKit console: speaker disabled ({e})")
+                _force_text_mode(self)
+            except Exception as e:
+                logger.warning(f"LiveKit console: speaker disabled ({e})")
+                _force_text_mode(self)
+
+        ChatCLI._update_microphone = safe_update_microphone  # type: ignore[attr-defined]
+        ChatCLI._update_speaker = safe_update_speaker  # type: ignore[attr-defined]
+
+    _patch_livekit_console_text_fallback()
+
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
         "--viz", action="store_true", help="Enable Rerun visualization (default off)"
@@ -559,14 +651,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--front-camera-index",
         type=int,
-        default=1,
-        help="Override front camera index (default 0)",
+        default=4,
+        help="Override front camera index (default: 0)",
     )
     parser.add_argument(
         "--wrist-camera-index",
         type=int,
-        default=0,
-        help="Override wrist camera index (default 2)",
+        default=2,
+        help="Override wrist camera index (default: 2)",
     )
     args, unknown = parser.parse_known_args()
 
