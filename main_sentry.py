@@ -42,7 +42,6 @@ from lekiwi.services.motors.wheels_service import WheelsService
 from lekiwi.services.pose_detection.pose_service import (
     PoseDetectionService,
     CameraStream,
-    default_visualizer,
 )
 from lekiwi.vision.camera_hub import CameraHub
 from lekiwi.viz.rerun_viz import create_viz, NullViz
@@ -143,11 +142,17 @@ class LeTars(Agent):
         self.wheels_service = WheelsService(
             robot=self.robot, robot_lock=self.robot_lock
         )
-        self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
+        # Use a short interpolation duration so recordings start quickly.
+        self.arms_service = ArmsService(
+            robot=self.robot, robot_lock=self.robot_lock, duration=0.6
+        )
         self.pose_service = PoseDetectionService(
             status_callback=self._handle_pose_status,
             camera=CameraStream(index=front_camera_index),
-            visualizer=None if self.viz_enabled else default_visualizer,
+            # Disable the OpenCV visualizer by default.
+            # On macOS, PoseDetectionService runs in a worker thread and cv2.imshow()
+            # commonly fails/hangs. Use the Rerun viz path instead.
+            visualizer=None,
             frame_subscription=self.front_sub_pose,
             viz=self.viz,
         )
@@ -158,11 +163,11 @@ class LeTars(Agent):
 
         # Start robot services
         self.wheels_service.start()
-        self.arms_service.start()
+        # Don't start in idle; we'll play wake_up first (faster, no long interpolation).
+        self.arms_service.start(start_idle=False, preload=["idle", "wake_up"])
         self.pose_service.start()
 
-        # Wake up animation
-        self.arms_service.dispatch("play", "wake_up")
+        # Wake-up is triggered in entrypoint, before the first spoken reply.
 
     def _start_camera_pumps(self):
         """Pump camera frames into viz in background threads."""
@@ -255,7 +260,9 @@ class LeTars(Agent):
         if status_type == "PERSON_FALLEN":
             # This callback runs on the pose worker thread.
             # Best practice: do NOT stop/join other threads from here.
-            self._request_enter_sentry(details)
+            # self._request_enter_sentry(details)
+            pass
+
         elif status_type == "PERSON_STABLE":
             self._request_exit_sentry(details)
 
@@ -484,8 +491,7 @@ class LeTars(Agent):
         try:
             # Send play event to animation service
             if type == "arm":
-                # self.arms_service.dispatch("play", recording_name)
-                return "Arm service is currently disabled"
+                self.arms_service.dispatch("play", recording_name)
             elif type == "wheels":
                 self.wheels_service.dispatch("play", recording_name)
             else:
@@ -528,6 +534,14 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Bind runtime so worker threads can request sentry mode safely.
     agent.bind_runtime(loop=asyncio.get_running_loop(), session=session)
+
+    # Start wake-up motion before the first spoken greeting.
+    try:
+        agent.arms_service.dispatch("play", "wake_up")
+        # Give the arms thread a small head start so motion begins before speech.
+        await asyncio.sleep(0.15)
+    except Exception:
+        pass
 
     await session.generate_reply(
         instructions=f"""When you wake up, greet with: 'Hello.'"""
