@@ -29,6 +29,7 @@ from lerobot.motors.feetech import (
     OperatingMode,
 )
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
@@ -51,6 +52,22 @@ class LeKiwi(Robot):
     def __init__(self, config: LeKiwiConfig):
         super().__init__(config)
         self.config = config
+
+        # Backward-compat: some setups stored calibration under robots/kiwi/<id>.json.
+        # Our robot type is "lekiwi", so the default path is robots/lekiwi/<id>.json.
+        # If we didn't load calibration but the legacy file exists, load it so motor
+        # normalization works (avoids "has no calibration registered").
+        try:
+            if (not self.calibration) and (not self.calibration_fpath.is_file()):
+                legacy_fpath = HF_LEROBOT_CALIBRATION / ROBOTS / "kiwi" / f"{self.id}.json"
+                if legacy_fpath.is_file():
+                    self._load_calibration(fpath=legacy_fpath)
+                    logger.warning(
+                        f"{self}: loaded legacy calibration from {legacy_fpath} (expected {self.calibration_fpath})"
+                    )
+        except Exception as e:
+            logger.warning(f"{self}: failed to load legacy calibration fallback: {e}")
+
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
             port=self.config.port,

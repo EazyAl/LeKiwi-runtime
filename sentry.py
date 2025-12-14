@@ -65,7 +65,7 @@ class Sentry:
         # Initialize LeKiwi without cameras (handled by CameraHub for vision services)
         # Using default port/id from main.py
         self.robot_config = LeKiwiConfig(
-            port="/dev/tty.usbmodem58760432781", 
+            port="/dev/ttyACM0", 
             id="biden_kiwi",
             cameras={} # No cameras managed by LeKiwi directly
         )
@@ -74,7 +74,7 @@ class Sentry:
         
         # --- Vision Setup ---
         # CameraHub manages the camera devices and distributes frames
-        self.camera_hub = CameraHub(front_index=1, wrist_index=0)
+        self.camera_hub = CameraHub(front_index=4, wrist_index=2)
         
         # --- Visualization Setup ---
         self.viz = create_viz(enable=True, app_id="lekiwi_sentry")

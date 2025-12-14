@@ -35,7 +35,7 @@ class EpipenService:
     """
 
     def __init__(
-        self, robot: LeKiwi, front_cam_sub=None, wrist_cam_sub=None, policy_path: str = "CRPlab/lekiwi_subset45_act_image_transform_policy_1"
+        self, robot: LeKiwi, front_cam_sub=None, wrist_cam_sub=None, policy_path: str = "CRPlab/lekiwi_light_policy_1"
     ):
         """
         Initialize epipen service with robot and ACT policy.
