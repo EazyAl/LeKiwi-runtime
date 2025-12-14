@@ -101,11 +101,11 @@ class Sentry:
             viz=self.viz
         )
         
-        # Epipen Service
+        # Epipen Service (ACT policy requires camera images)
         self.epipen_service = EpipenService(
             robot=self.robot,
             front_cam_sub=self.camera_hub.subscribe_front(max_queue=1),
-            wrist_cam_sub=self.camera_hub.subscribe_wrist(max_queue=1)
+            wrist_cam_sub=self.camera_hub.subscribe_wrist(max_queue=1),
         )
         
         # State management
@@ -217,7 +217,7 @@ class Sentry:
         
         # 3. Record response
         logger.info("Recording response (5s)...")
-        audio_data = self._record_audio(duration=5)
+        audio_data = self._record_audio(duration=0.5)
         
         # 4. Check response
         if self._is_loud_enough(audio_data):
