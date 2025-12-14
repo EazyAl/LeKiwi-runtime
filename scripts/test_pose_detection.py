@@ -47,6 +47,9 @@ def main():
             # Read frame from camera
             frame = camera.read()
 
+            # Rotate camera frame 180 degrees (flip both vertically and horizontally)
+            frame = cv2.flip(frame, -1)
+
             # Perform pose estimation
             result = pose_estimator.infer(frame)
             landmarks = (

@@ -9,6 +9,16 @@ from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
 
+# Disable tokenizers parallelism to avoid fork warnings with PI0 policy
+# Must be set before any HuggingFace imports
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Suppress verbose DEBUG logging from lerobot cameras and robot before any imports
+# Must be done early before the loggers are created
+logging.getLogger("lerobot.cameras.opencv.camera_opencv").setLevel(logging.WARNING)
+logging.getLogger("lerobot.cameras").setLevel(logging.WARNING)
+logging.getLogger("lekiwi.robot.lekiwi").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 from livekit import rtc, agents
 from livekit.agents import (
@@ -44,8 +54,6 @@ from lekiwi.viz.rerun_viz import create_viz, NullViz
 load_dotenv()
 
 _RUN_ARGS = {
-    "stream_enabled": False,
-    "stream_port": 5556,
     "front_idx": 0,
     "wrist_idx": 2,
     "viz_enabled": False,
@@ -109,8 +117,6 @@ class LeTars(Agent):
         self,
         port: str = "/dev/tty.usbmodem58760432781",
         robot_id: str = "biden_kiwi",
-        stream_data: bool = False,
-        stream_port: int = 5556,
         viz_enabled: bool = False,
         front_camera_index: int = 0,
         wrist_camera_index: int = 2,
@@ -127,7 +133,20 @@ class LeTars(Agent):
         self._pending_llm_lock = threading.Lock()
 
         # Initialize single shared robot connection
-        self.robot_config = LeKiwiConfig(port=port, id=robot_id, cameras={})
+        from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
+        self.robot_config = LeKiwiConfig(
+            port=port,
+            id=robot_id,
+            cameras={
+                "front": OpenCVCameraConfig(
+                    index_or_path=0, width=1280, height=720, fps=30
+                ),
+                "wrist": OpenCVCameraConfig(
+                    index_or_path=1, width=1280, height=720, fps=30
+                ),
+            },
+        )
         self.robot = LeKiwi(self.robot_config)
         self.robot.connect(calibrate=False)
 
@@ -166,7 +185,8 @@ class LeTars(Agent):
         self.wheels_service = WheelsService(
             robot=self.robot, robot_lock=self.robot_lock
         )
-        self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
+        # Commented out for testing.
+        # self.arms_service = ArmsService(robot=self.robot, robot_lock=self.robot_lock)
 
         # Pose service camera selection:
         self.pose_service = PoseDetectionService(
@@ -201,11 +221,11 @@ class LeTars(Agent):
 
         # Start robot services
         self.wheels_service.start()
-        self.arms_service.start()
+        # self.arms_service.start()
         self.pose_service.start()
 
         # Wake up animation
-        self.arms_service.dispatch("play", "wake_up")
+        # self.arms_service.dispatch("play", "wake_up")
 
     def _start_camera_pumps(self):
         """Pump camera frames into viz in background threads."""
@@ -333,11 +353,8 @@ class LeTars(Agent):
     @function_tool
     async def get_available_recordings(self) -> str:
         """
-        Discover your physical expressions! Get your repertoire of motor movements for body language.
-        Use this when you're curious about what physical expressions you can perform, or when someone
-        asks about your capabilities. Each recording is a choreographed movement that shows personality -
-        like head tilts, nods, excitement wiggles, or confused gestures. Check this regularly to remind
-        yourself of your expressive range!
+        Use this tool to double check what recordings (i.e. physical expressions) you can input to
+        the play_recording tool.
 
         Returns:
             List of available physical expression recordings you can perform.
@@ -345,8 +362,8 @@ class LeTars(Agent):
         print("LeKiwi: get_available_recordings function called")
         self._log_tool("get_available_recordings", "call")
         try:
-            recordings = self.arms_service.get_available_recordings()
-            recordings += self.wheels_service.get_available_recordings()
+            # recordings = self.arms_service.get_available_recordings()
+            recordings = self.wheels_service.get_available_recordings()
 
             if recordings:
                 result = f"Available recordings: {', '.join(recordings)}"
@@ -364,15 +381,12 @@ class LeTars(Agent):
     @function_tool
     async def play_recording(self, recording_name: str, type: str = "arms") -> str:
         """
-        Express yourself through physical movement! Use this constantly to show personality and emotion.
-        Perfect for: greeting gestures, excited bounces, confused head tilts, thoughtful nods,
-        celebratory wiggles, disappointed slouches, or any emotional response that needs body language.
-        Combine with RGB colors for maximum expressiveness! Your movements are like a dog wagging its tail -
-        use them frequently to show you're alive, engaged, and have personality. Don't just talk, MOVE!
+        Use this tool to play a prerecorded movement (arms or wheels).
+        Call get_available_recordings() first to see valid names.
 
         Args:
-            recording_name: Name of the physical expression to perform (use get_available_recordings first)
-            type: arms or wheels
+            recording_name: Name of the recording to perform.
+            type: "arms" or "wheels".
         """
         print(
             f"LeKiwi: play_recording function called with recording_name: {recording_name}"
@@ -381,7 +395,8 @@ class LeTars(Agent):
         try:
             # Send play event to animation service
             if type == "arms":
-                self.arms_service.dispatch("play", recording_name)
+                # self.arms_service.dispatch("play", recording_name)
+                return "Arms service is currently disabled"
             elif type == "wheels":
                 self.wheels_service.dispatch("play", recording_name)
             else:
@@ -396,9 +411,33 @@ class LeTars(Agent):
         return result
 
     @function_tool
+    async def administer_epipen(self) -> str:
+        """
+        Use this tool to administer the epipen via the epipen service.
+        This blocks until the epipen administration is complete.
+
+        Returns:
+            Confirmation message indicating successful epipen administration or failure reason.
+        """
+
+        # Check if service is ready
+        if not hasattr(self, "epipen_service") or not self.epipen_service.is_ready():
+            return "Error: Epipen service not available. Check π₀.₅ installation."
+
+        # Execute synchronous epipen administration
+        try:
+            result = self.epipen_service.administer_epipen()
+            logger.info(f"LeKiwi: administer_epipen completed with result: {result}")
+            return result
+        except Exception as e:
+            error_msg = f"Epipen administration failed: {str(e)}"
+            logger.error(f"LeKiwi: administer_epipen error: {error_msg}")
+            return error_msg
+
+    @function_tool
     async def get_configuration(self) -> str:
         """
-        Get the status of the robot.
+        Use this tool to get the robot status/configuration (currently a stub).
         """
         # TODO: Implement this with proper configuration checking and return as json () - see https://github.com/TARS-AI-Community/TARS-AI/blob/V2/src/character/TARS/persona.ini
         result = "Status: Nominal"
@@ -408,14 +447,11 @@ class LeTars(Agent):
     @function_tool
     async def toggle_state(self, mode: str) -> str:
         """
-        Toggle between emergency mode, concerned mode, and normal mode. Use this to switch the robot's operational state.
-        This affects how the robot behaves and responds to situations.
-
-        When switching to "concerned" mode, the help workflow will automatically start.
+        Use this tool to set the robot operational mode.
+        If switching to "concerned", the "help" workflow will automatically start.
 
         Args:
-            mode: Either "emergency" to enter emergency mode, "normal" to return to normal mode,
-                  or "concerned" to enter concerned mode (which automatically starts the help workflow).
+            mode: "emergency", "normal", or "concerned".
 
         Returns:
             Confirmation message indicating the current mode.
@@ -464,10 +500,7 @@ class LeTars(Agent):
     @function_tool
     async def get_available_workflows(self) -> str:
         """
-        Discover what workflows you can execute! Get your repertoire of user-defined step workflows.
-        Use this when someone asks you about your capabilities or when they ask you to execute a workflow.
-        Each workflow is a user-defined graph or general instructions -
-        like emergency response, assistance routines, or specific operational sequences.
+        Use this tool to list workflows you can start with start_workflow().
 
         Returns:
             List of available workflow names you can execute.
@@ -492,12 +525,12 @@ class LeTars(Agent):
 
     @function_tool
     async def start_workflow(self, workflow_name: str) -> str:
-        f"""
-        Start a workflow called {workflow_name}. This sets the workflow_service's active workflow.
-        In order to perform the workflow you will need to iteratively call the get_next_step function until the workflow is complete.
-        
+        """
+        Use this tool to start a workflow by name.
+        After starting, call get_next_step() and complete_step() until the workflow completes.
+
         Args:
-            workflow_name: Name of the workflow to start. Check the available workflows with the get_available_workflows function first.
+            workflow_name: Name of the workflow to start (see get_available_workflows()).
         """
         logger.debug(
             f"LeKiwi: start_workflow function called with workflow_name: {workflow_name}"
@@ -517,12 +550,11 @@ class LeTars(Agent):
     @function_tool
     async def get_next_step(self) -> str:
         """
-        Get the current step in the active workflow with full context.
-        Shows you what to do, what tools to use, and what state variables you can update.
-        After fulfilling the instructions of the this step, call complete_step() to advance.
+        Use this tool to fetch the next step for the active workflow.
+        After you complete the instructions, call complete_step() to advance.
 
         Returns:
-            Your next instruction to fulfill, written in plain language, possibly with some suggested tools to use. It will also provide context about available the workflows state variables that you can update.
+            The next step instructions (including context and optional state variables).
         """
         logger.debug(f"\n{'='*60}")
         logger.debug(f"LeKiwi: get_next_step called")
@@ -559,12 +591,11 @@ class LeTars(Agent):
         self, state_updates: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Complete the current workflow step and advance to the next one.
-        Optionally update state variables that affect workflow routing.
+        Use this tool to mark the current workflow step complete and advance.
+        Optionally provide state updates to influence workflow routing.
 
         Args:
-            state_updates: Optional dict of state updates, e.g. {"user_response_detected": true, "attempt_count": 1}
-                          Leave empty if no state needs updating.
+            state_updates: Optional dict of state updates (leave empty if none).
 
         Returns:
             Information about the next step or workflow completion message.
@@ -641,8 +672,6 @@ class LeTars(Agent):
 # Entry to the agent
 async def entrypoint(ctx: agents.JobContext):
     # Use pre-parsed arguments from __main__
-    stream_enabled = _RUN_ARGS["stream_enabled"]
-    stream_port = _RUN_ARGS["stream_port"]
     front_idx = _RUN_ARGS["front_idx"]
     wrist_idx = _RUN_ARGS["wrist_idx"]
     viz_enabled = _RUN_ARGS["viz_enabled"]
@@ -650,10 +679,8 @@ async def entrypoint(ctx: agents.JobContext):
     # Parse which workflows to preload
     workflow_names = parse_workflow_args()
 
-    # Initialize agent with streaming enabled if requested
+    # Initialize agent
     agent = LeTars(
-        stream_data=stream_enabled,
-        stream_port=stream_port,
         viz_enabled=viz_enabled,
         front_camera_index=front_idx,
         wrist_camera_index=wrist_idx,
@@ -712,12 +739,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
-        "--stream", action="store_true", help="Enable data streaming for visualization"
-    )
-    parser.add_argument(
-        "--stream-port", type=int, default=5556, help="Port for ZMQ data streaming"
-    )
-    parser.add_argument(
         "--viz", action="store_true", help="Enable Rerun visualization (default off)"
     )
     parser.add_argument(
@@ -735,8 +756,6 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
 
     # Capture custom flags for use in entrypoint and strip them from argv before LiveKit parses.
-    _RUN_ARGS["stream_enabled"] = bool(args.stream)
-    _RUN_ARGS["stream_port"] = int(args.stream_port)
     _RUN_ARGS["viz_enabled"] = bool(args.viz)
     _RUN_ARGS["front_idx"] = int(args.front_camera_index)
     _RUN_ARGS["wrist_idx"] = int(args.wrist_camera_index)

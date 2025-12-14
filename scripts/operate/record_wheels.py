@@ -49,8 +49,9 @@ def main():
 
     input("Press Enter to start recording...")
 
+    # Save into the repo's lekiwi/recordings/wheels folder.
     recordings_dir = os.path.join(
-        os.path.dirname(__file__), "..", "lekiwi", "recordings", "wheels"
+        os.path.dirname(__file__), "..", "..", "lekiwi", "recordings", "wheels"
     )
     os.makedirs(recordings_dir, exist_ok=True)
 

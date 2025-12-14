@@ -6,8 +6,6 @@ Uses lerobot's official preprocessor/postprocessor pipeline for proper normaliza
 import time
 import logging
 from typing import Optional
-import numpy as np
-import torch
 from lekiwi.robot.lekiwi import LeKiwi
 
 # lerobot imports for policy inference with proper normalization
@@ -110,12 +108,11 @@ class EpipenService:
                 logger.info(f"ACT policy loaded successfully on device: {self.device}")
             except Exception as e:
                 logger.error(f"Failed to load ACT policy: {e}")
-                import traceback
-                traceback.print_exc()
+                self.policy = None
 
         # Task description matching the training data
         self._task_description = "pick up object and stab object"
-        
+
         # Robot type for multi-embodiment support
         self._robot_type = "lekiwi"
 
@@ -238,6 +235,7 @@ class EpipenService:
                     error_msg = f"VLA inference/execution error: {str(e)}"
                     logger.error(error_msg)
                     import traceback
+
                     traceback.print_exc()
                     return error_msg
 
@@ -277,20 +275,21 @@ class EpipenService:
     def _get_camera_frame(self, cam_sub, cam_name: str) -> Optional[np.ndarray]:
         """
         Get the latest camera frame from a subscription.
-        
+
         Args:
             cam_sub: Camera subscription object with pull() method
             cam_name: Name of the camera for logging
-            
+
         Returns:
             numpy array of shape (H, W, 3) in BGR format, or None if unavailable
         """
         if cam_sub is None:
             logger.warning(f"No subscription for {cam_name} camera")
             return None
-        
+
         try:
             import cv2
+
             pulled = cam_sub.pull(timeout=0.1)
             if pulled is None:
                 return None
@@ -311,7 +310,10 @@ class EpipenService:
                 frame = cv2.rotate(frame, rotate_code)
             
             # Ensure frame is the right shape (resize if needed)
-            if frame.shape[0] != self._image_height or frame.shape[1] != self._image_width:
+            if (
+                frame.shape[0] != self._image_height
+                or frame.shape[1] != self._image_width
+            ):
                 frame = cv2.resize(frame, (self._image_width, self._image_height))
             return frame
         except Exception as e:

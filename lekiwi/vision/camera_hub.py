@@ -16,6 +16,8 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+import os
+from pathlib import Path
 
 
 @dataclass
@@ -47,10 +49,81 @@ class CameraWorker:
         self._thread = threading.Thread(
             target=self._run, name=f"cam-{name}", daemon=True
         )
-        self._cap = cv2.VideoCapture(index)
-        self._cap.set(cv2.CAP_PROP_FPS, fps)
+
+        # Best-effort robust open on Linux where OpenCV may pick an unexpected backend
+        # (e.g. OBSensor) when using integer indices.
+        self._cap = self._open_capture(index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera {name} (index {index})")
+
+        # Optional tuning knobs via env (keeps call sites stable).
+        # These match main_sentry's env knobs.
+        fourcc = os.getenv("LEKIWI_CAMERA_FOURCC", "").strip()
+        if len(fourcc) == 4:
+            try:
+                self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            except Exception:
+                pass
+        try:
+            self._cap.set(cv2.CAP_PROP_FPS, fps)
+        except Exception:
+            pass
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        # Optional size override (useful to keep CPU down).
+        w = os.getenv("LEKIWI_CAMERA_WIDTH", "").strip()
+        h = os.getenv("LEKIWI_CAMERA_HEIGHT", "").strip()
+        if w.isdigit() and h.isdigit():
+            try:
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(int(w)))
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(int(h)))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _open_capture(index: int) -> cv2.VideoCapture:
+        """
+        Try opening /dev/videoN first (more stable), then fall back to index.
+        Prefer V4L2 backend on Linux when possible.
+        """
+        dev_path = Path("/dev") / f"video{index}"
+
+        # 1) Try device path without forcing backend (works on more OpenCV builds)
+        if dev_path.exists():
+            cap = cv2.VideoCapture(str(dev_path))
+            if cap is not None and cap.isOpened():
+                return cap
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+
+            # 2) Try device path with V4L2 backend
+            cap = cv2.VideoCapture(str(dev_path), cv2.CAP_V4L2)
+            if cap is not None and cap.isOpened():
+                return cap
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+
+        # 3) Try integer index with V4L2 backend
+        cap = cv2.VideoCapture(int(index), cv2.CAP_V4L2)
+        if cap is not None and cap.isOpened():
+            return cap
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+
+        # 4) Last resort: integer index default backend
+        return cv2.VideoCapture(int(index))
 
     def start(self) -> None:
         self._thread.start()

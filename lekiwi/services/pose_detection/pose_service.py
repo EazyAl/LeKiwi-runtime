@@ -33,7 +33,11 @@ class CameraStream:
         self.cap: Optional[cv2.VideoCapture] = None
 
     def start(self) -> None:
-        self.cap = cv2.VideoCapture(self.index)
+        # Prefer V4L2 on Linux to avoid OpenCV selecting an unexpected backend.
+        try:
+            self.cap = cv2.VideoCapture(int(self.index), cv2.CAP_V4L2)
+        except Exception:
+            self.cap = cv2.VideoCapture(self.index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {self.index}")
 
@@ -155,6 +159,7 @@ class PoseDetectionService(ServiceBase):
         self.prev_is_fall_state = False  # Replaces self.prev_state
         self.target_width = target_width
         self.frame_skip = max(0, frame_skip)
+        self._fall_freeze_until = 0.0
 
         # Variables for event loop (initialized in _event_loop)
         self._frame_idx = 0
@@ -283,25 +288,43 @@ class PoseDetectionService(ServiceBase):
 
                 if landmarks:
                     event = self.detector.detect(landmarks)
-                    if event:
-                        is_fall = event.is_fall
-                        # --- Event Emission Logic ---
-                        if is_fall != self.prev_is_fall_state:
-                            # 4. Use the status_callback to notify LeKiwi (the orchestrator)
-                            event_data = {
-                                "score": event.score,
-                                "ratio": event.ratio,
-                                "timestamp": event.timestamp,
-                                "quality": quality,
-                            }
-                            event_type = "PERSON_FALLEN" if is_fall else "PERSON_STABLE"
-                            self.status_callback(event_type, event_data)
 
-                        self.prev_is_fall_state = is_fall
-                    else:
-                        self.prev_is_fall_state = False  # No landmarks, assume no event
+                # Determine raw detection result
+                detected_fall = False
+                if event:
+                    detected_fall = event.is_fall
+
+                # Apply freeze logic
+                if time.time() < self._fall_freeze_until:
+                    is_fall = True
                 else:
-                    self.prev_is_fall_state = False  # No pose detected
+                    is_fall = detected_fall
+                    if is_fall:
+                        self._fall_freeze_until = time.time() + 3.0
+
+                if is_fall != self.prev_is_fall_state:
+                    # Prepare event data
+                    if event:
+                        event_data = {
+                            "score": event.score,
+                            "ratio": event.ratio,
+                            "timestamp": event.timestamp,
+                            "quality": quality,
+                        }
+                    else:
+                        # Fallback if frozen but no current event
+                        evt = self._last_fall_event
+                        event_data = {
+                            "score": evt.score if evt else 1.0,
+                            "ratio": evt.ratio if evt else 0.0,
+                            "timestamp": time.time(),
+                            "quality": quality,
+                        }
+
+                    event_type = "PERSON_FALLEN" if is_fall else "PERSON_STABLE"
+                    self.status_callback(event_type, event_data)
+
+                self.prev_is_fall_state = is_fall
                 self._last_fall_event = event or self._last_fall_event
                 self._last_is_fall = is_fall
 

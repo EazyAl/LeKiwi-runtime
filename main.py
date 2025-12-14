@@ -1,4 +1,3 @@
-import logging
 import sys
 from pathlib import Path
 import time
@@ -24,7 +23,6 @@ from lekiwi.services.pose_detection import (
 )
 from lekiwi.viz.rerun_viz import create_viz, NullViz
 from lekiwi.vision.camera_hub import CameraHub
-import zmq
 
 load_dotenv()
 
@@ -171,7 +169,7 @@ class LeTars(Agent):
 
         if status_type == "PERSON_FALLEN":
             # Example 2: Dispatch a HIGH-priority motor action (e.g., look up, check)
-            self.wheels_service.dispatch("play", "spin")
+            # administer the epipen
             # log it
             print(f"LeKiwi: Person fallen detected, dispatching spin action")
             self.status = "concerned"
@@ -281,7 +279,7 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     await session.generate_reply(
-        instructions=f"""When you wake up, greet with: 'Systems nominal. What's the plan?' or 'All systems operational. Nice to see you sir.'"""
+        instructions=f"""When you wake up, greet with: 'Hello.'"""
     )
 
 
