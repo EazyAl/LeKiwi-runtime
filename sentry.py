@@ -9,6 +9,7 @@ import os
 import tempfile
 import scipy.io.wavfile as wav
 import cv2
+import argparse
 
 # Set logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -78,8 +79,20 @@ class MockRobot:
         return {}
 
 class Sentry:
-    def __init__(self):
-        self.state = "NORMAL" # NORMAL, CONCERN, EMERGENCY
+    def __init__(
+        self,
+        *,
+        port: str = "/dev/ttyACM0",
+        robot_id: str = "biden_kiwi",
+        front_index: int = 4,
+        wrist_index: int = 2,
+        top_index: int = 6,
+        start_state: str = "NORMAL",
+        viz_enabled: bool = True,
+        enable_pose_service: bool = True,
+        rotate_180: bool = True,
+    ):
+        self.state = start_state  # NORMAL, CONCERN, EMERGENCY
         self.running = True
 
         # Serialize base motor commands across background threads (tracking vs navigation vs emergency)
@@ -89,8 +102,8 @@ class Sentry:
         # Initialize LeKiwi without cameras (handled by CameraHub for vision services)
         # Using default port/id from main.py
         self.robot_config = LeKiwiConfig(
-            port="/dev/ttyACM0", 
-            id="biden_kiwi",
+            port=port,
+            id=robot_id,
             cameras={} # No cameras managed by LeKiwi directly
         )
         self.robot = LeKiwi(self.robot_config)
@@ -98,10 +111,10 @@ class Sentry:
         
         # --- Vision Setup ---
         # CameraHub manages the camera devices and distributes frames
-        self.camera_hub = CameraHub(front_index=4, wrist_index=2, top_index=6)
+        self.camera_hub = CameraHub(front_index=front_index, wrist_index=wrist_index, top_index=top_index)
         
         # --- Visualization Setup ---
-        self.viz = create_viz(enable=True, app_id="lekiwi_sentry")
+        self.viz = create_viz(enable=bool(viz_enabled), app_id="lekiwi_sentry")
         # Subscribe to wrist camera for visualization
         self.wrist_sub = self.camera_hub.subscribe_wrist(max_queue=2)
         self.top_sub = self.camera_hub.subscribe_top(max_queue=2)
@@ -110,27 +123,30 @@ class Sentry:
         
         # Pose Detection Service
         # Subscribes to front camera frames
-        self.pose_sub = RotatedSubscription(
-            self.camera_hub.subscribe_front(max_queue=2),
-            rotate_180=True,
-        )
-        self.pose_service = PoseDetectionService(
-            status_callback=self._handle_pose_status,
-            frame_subscription=self.pose_sub,
-            viz=self.viz
-        )
+        self.pose_service = None
+        self.pose_sub = None
+        if enable_pose_service:
+            self.pose_sub = RotatedSubscription(
+                self.camera_hub.subscribe_front(max_queue=2),
+                rotate_180=bool(rotate_180),
+            )
+            self.pose_service = PoseDetectionService(
+                status_callback=self._handle_pose_status,
+                frame_subscription=self.pose_sub,
+                viz=self.viz
+            )
         
         # Navigator Service
         # Always-on navigation tracking (NORMAL state): warms models + maintains last-known thigh/distance.
         self.nav_track_sub = RotatedSubscription(
             self.camera_hub.subscribe_front(max_queue=2),
-            rotate_180=True,
+            rotate_180=bool(rotate_180),
         )
 
         # Navigation execution subscription (CONCERN state): separate queue so tracking doesn't starve driving.
         self.nav_sub = RotatedSubscription(
             self.camera_hub.subscribe_front(max_queue=2),
-            rotate_180=True,
+            rotate_180=bool(rotate_180),
         )
 
         self.navigator = CombinedNavigator(
@@ -151,17 +167,17 @@ class Sentry:
         # release our robot connection and stop CameraHub before launching it.
         self.lerobot_record = LeRobotRecordService(
             LeRobotRecordConfig(
-                robot_port="/dev/ttyACM0",
-                robot_id="biden_kiwi",
-                front_index_or_path=6,
-                wrist_index_or_path=2,
+                robot_port=port,
+                robot_id=robot_id,
+                front_index_or_path=top_index,
+                wrist_index_or_path=wrist_index,
                 front_width=640,
                 front_height=480,
                 front_fps=30,
                 wrist_width=640,
                 wrist_height=480,
                 wrist_fps=30,
-                wrist_rotation=180,
+                wrist_rotation=(180 if rotate_180 else 0),
                 # Base name only; the subprocess runner will append a random suffix each run
                 # so LeRobot writes to a fresh local dataset folder.
                 dataset_repo_id="CRPlab/eval_letars_test_2_3",
@@ -177,6 +193,9 @@ class Sentry:
         
         # State management
         self.fall_event = threading.Event()
+        if self.state != "NORMAL":
+            # If we are starting already triggered, don't wait for pose to set fall_event.
+            self.fall_event.set()
         
     def start(self):
         logger.info("Starting Sentry System...")
@@ -196,8 +215,9 @@ class Sentry:
         threading.Thread(target=self._pump_wrist, daemon=True, name="wrist-viz").start()
         
         # Start Pose Service
-        logger.info("Starting pose detection...")
-        self.pose_service.start()
+        if self.pose_service is not None:
+            logger.info("Starting pose detection...")
+            self.pose_service.start()
         
         # Main State Machine Loop
         try:
@@ -228,7 +248,11 @@ class Sentry:
             self._nav_tracking_enabled.clear()
         except Exception:
             pass
-        self.pose_service.stop()
+        try:
+            if self.pose_service is not None:
+                self.pose_service.stop()
+        except Exception:
+            pass
         self.camera_hub.stop()
         if self.viz:
             self.viz.close()
@@ -461,5 +485,33 @@ class Sentry:
         return any(word in text for word in positive_keywords)
 
 if __name__ == "__main__":
-    sentry = Sentry()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("--port", type=str, default=os.getenv("LEKIWI_PORT", "/dev/ttyACM0"))
+    parser.add_argument("--robot-id", type=str, default=os.getenv("LEKIWI_ROBOT_ID", "biden_kiwi"))
+    parser.add_argument("--front-index", type=int, default=int(os.getenv("LEKIWI_FRONT_INDEX", "4")))
+    parser.add_argument("--wrist-index", type=int, default=int(os.getenv("LEKIWI_WRIST_INDEX", "2")))
+    parser.add_argument("--top-index", type=int, default=int(os.getenv("LEKIWI_TOP_INDEX", "6")))
+    parser.add_argument(
+        "--start-state",
+        type=str,
+        default=os.getenv("LEKIWI_SENTRY_START_STATE", "CONCERN"),
+        choices=["NORMAL", "CONCERN", "EMERGENCY"],
+        help="Start state. Use CONCERN/EMERGENCY when launched after a fall trigger.",
+    )
+    parser.add_argument("--no-viz", action="store_true", help="Disable Rerun viz")
+    parser.add_argument("--no-pose", action="store_true", help="Disable pose service (skip fall detection)")
+    parser.add_argument("--rotate-180", action="store_true", help="Rotate front frames 180 degrees")
+    args = parser.parse_args()
+
+    sentry = Sentry(
+        port=args.port,
+        robot_id=args.robot_id,
+        front_index=args.front_index,
+        wrist_index=args.wrist_index,
+        top_index=args.top_index,
+        start_state=args.start_state,
+        viz_enabled=(not args.no_viz),
+        enable_pose_service=(not args.no_pose),
+        rotate_180=bool(args.rotate_180),
+    )
     sentry.start()

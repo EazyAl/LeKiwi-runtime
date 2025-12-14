@@ -164,11 +164,17 @@ class CameraWorker:
 
 class CameraHub:
     def __init__(
-        self, front_index: int = 0, wrist_index: int = 2, top_index: int = 4, fps: int = 30
+        self,
+        front_index: int = 0,
+        wrist_index: int = 2,
+        top_index: Optional[int] = None,
+        fps: int = 30,
     ) -> None:
         self.front_worker = CameraWorker("front", front_index, fps=fps)
         self.wrist_worker = CameraWorker("wrist", wrist_index, fps=fps)
-        self.top_worker = CameraWorker("top", top_index, fps=fps)
+        self.top_worker: Optional[CameraWorker] = (
+            CameraWorker("top", int(top_index), fps=fps) if top_index is not None else None
+        )
         self._started = False
 
     def start(self) -> None:
@@ -176,7 +182,8 @@ class CameraHub:
             return
         self.front_worker.start()
         self.wrist_worker.start()
-        self.top_worker.start()
+        if self.top_worker is not None:
+            self.top_worker.start()
         self._started = True
 
     def stop(self) -> None:
@@ -184,7 +191,8 @@ class CameraHub:
             return
         self.front_worker.stop()
         self.wrist_worker.stop()
-        self.top_worker.stop()
+        if self.top_worker is not None:
+            self.top_worker.stop()
         self._started = False
 
     def subscribe_front(self, max_queue: int = 1) -> CameraSubscription:
@@ -194,4 +202,6 @@ class CameraHub:
         return self.wrist_worker.subscribe(max_queue=max_queue)
 
     def subscribe_top(self, max_queue: int = 1) -> CameraSubscription:
+        if self.top_worker is None:
+            raise RuntimeError("Top camera is disabled (top_index=None)")
         return self.top_worker.subscribe(max_queue=max_queue)

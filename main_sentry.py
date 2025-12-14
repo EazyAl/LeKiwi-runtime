@@ -39,10 +39,7 @@ from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 
 from lekiwi.services.motors.arms_service import ArmsService
 from lekiwi.services.motors.wheels_service import WheelsService
-from lekiwi.services.pose_detection.pose_service import (
-    PoseDetectionService,
-    CameraStream,
-)
+from lekiwi.services.sentry.sentry_service import SentryService
 from lekiwi.vision.camera_hub import CameraHub
 from lekiwi.viz.rerun_viz import create_viz, NullViz
 
@@ -87,6 +84,7 @@ class LeTars(Agent):
         self._session: Optional[AgentSession] = None
         self._sentry_task: Optional[asyncio.Task] = None
         self._sentry_schedule_lock = threading.Lock()
+        self._speak_lock: Optional[asyncio.Lock] = None
 
         # Initialize single shared robot connection
         from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
@@ -105,6 +103,12 @@ class LeTars(Agent):
         # Avoid double-opening the same cameras when viz is enabled.
         # CameraHub owns the OpenCV cameras; the robot connection is only for motors in this runtime.
         use_robot_cameras = (not viz_enabled) and (os.getenv("LEKIWI_ROBOT_USE_CAMERAS", "0") == "1")
+
+        # Front camera rotation for pose/thigh tracking.
+        # IMPORTANT: default is OFF to match the historical PoseDetectionService path.
+        # Enable if your physical mount is upside-down:
+        #   export LEKIWI_FRONT_ROTATE_180=1
+        front_rotate_180 = os.getenv("LEKIWI_FRONT_ROTATE_180", "0").strip() == "1"
 
         self.robot_config = LeKiwiConfig(
             port=port,
@@ -137,8 +141,7 @@ class LeTars(Agent):
         self.viz_enabled = viz_enabled
         self.viz = create_viz(viz_enabled, app_id="lekiwi_viz")
         self.camera_hub = None
-        self.front_sub_pose = None
-        self.front_sub_nav = None
+        self.front_sub_sentry = None
         self.front_sub_viz = None
         self.wrist_sub_viz = None
         self._viz_pump_stop = threading.Event()
@@ -150,16 +153,14 @@ class LeTars(Agent):
                 fps=camera_fps,
             )
             self.camera_hub.start()
-            self.front_sub_pose = self.camera_hub.subscribe_front(max_queue=2)
-            self.front_sub_nav = self.camera_hub.subscribe_front(max_queue=2)
+            self.front_sub_sentry = self.camera_hub.subscribe_front(max_queue=2)
             self.wrist_sub_viz = self.camera_hub.subscribe_wrist(max_queue=2)
             self._start_camera_pumps()
             self.viz.set_status("normal", ts=time.time())
         else:
             self.viz = NullViz()
             self.camera_hub = None
-            self.front_sub_pose = None
-            self.front_sub_nav = None
+            self.front_sub_sentry = None
             self.wrist_sub_viz = None
 
         # Lock to serialize access to robot motor commands (serial port is not thread-safe)
@@ -173,14 +174,13 @@ class LeTars(Agent):
         self.arms_service = ArmsService(
             robot=self.robot, robot_lock=self.robot_lock, duration=0.6
         )
-        self.pose_service = PoseDetectionService(
-            status_callback=self._handle_pose_status,
-            camera=CameraStream(index=front_camera_index),
-            # Disable the OpenCV visualizer by default.
-            # On macOS, PoseDetectionService runs in a worker thread and cv2.imshow()
-            # commonly fails/hangs. Use the Rerun viz path instead.
-            visualizer=None,
-            frame_subscription=self.front_sub_pose,
+        self.sentry_service = SentryService(
+            robot=self.robot,
+            robot_lock=self.robot_lock,
+            on_fall=self._handle_fall_detected,
+            frame_subscription=self.front_sub_sentry,
+            camera_index=front_camera_index,
+            rotate_180=front_rotate_180,
             viz=self.viz,
         )
 
@@ -192,7 +192,7 @@ class LeTars(Agent):
         self.wheels_service.start()
         # Don't start in idle; we'll play wake_up first (faster, no long interpolation).
         self.arms_service.start(start_idle=False, preload=["idle", "wake_up"])
-        self.pose_service.start()
+        self.sentry_service.start()
 
         # Wake-up is triggered in entrypoint, before the first spoken reply.
 
@@ -244,6 +244,11 @@ class LeTars(Agent):
         """Bind asyncio loop + session (called from async entrypoint thread)."""
         self._runtime_loop = loop
         self._session = session
+        # Ensure speech calls are serialized to avoid LiveKit/OpenAI "active response" errors.
+        try:
+            self._speak_lock = asyncio.Lock()
+        except Exception:
+            self._speak_lock = None
 
     def _log_tool(
         self, name: str, message: str, level: str = "info", emoji: str = "🧰"
@@ -265,6 +270,13 @@ class LeTars(Agent):
             except:
                 pass  # Ignore errors during cleanup
         try:
+            svc = getattr(self, "sentry_service", None)
+            if svc is not None:
+                svc.stop(timeout=1.0)
+        except Exception:
+            pass
+
+        try:
             self._stop_camera_pumps()
             hub = getattr(self, "camera_hub", None)
             if hub is not None:
@@ -275,23 +287,13 @@ class LeTars(Agent):
         except Exception:
             pass
 
-    def _handle_pose_status(self, status_type: str, details: dict):
+    def _handle_fall_detected(self, details: Dict[str, Any]) -> None:
         """
-        Callback method to receive status updates from the PoseDetectionService.
-        This runs in the context of the service's worker thread, but is called by it.
+        Called from SentryService worker thread when a fall is detected.
+        IMPORTANT: do not stop/join other threads here; just schedule sentry transition.
         """
-        print(
-            f"LeKiwi: Received pose status update - Type: {status_type}, Details: {details}"
-        )
-
-        if status_type == "PERSON_FALLEN":
-            # This callback runs on the pose worker thread.
-            # Best practice: do NOT stop/join other threads from here.
-            # self._request_enter_sentry(details)
-            pass
-
-        elif status_type == "PERSON_STABLE":
-            self._request_exit_sentry(details)
+        logger.warning(f"LeKiwi: fall detected (sentry trigger): {details}")
+        self._request_enter_sentry(details)
 
     def _request_enter_sentry(self, details: Dict[str, Any]) -> None:
         loop = self._runtime_loop
@@ -335,7 +337,7 @@ class LeTars(Agent):
             pass
 
         try:
-            self.pose_service.stop(timeout=2.0)
+            self.sentry_service.stop(timeout=2.0)
         except Exception:
             pass
 
@@ -373,7 +375,7 @@ class LeTars(Agent):
         except Exception:
             pass
         try:
-            self.pose_service.start()
+            self.sentry_service.start()
         except Exception:
             pass
 
@@ -382,7 +384,16 @@ class LeTars(Agent):
             logger.warning(f"LeKiwi: (no session) would say: {text}")
             return
         try:
-            await self._session.generate_reply(instructions=f"Say: '{text}'")
+            lock = self._speak_lock
+            if lock is not None and getattr(lock, "locked", lambda: False)():
+                # Don't stack speech requests; skip if the model is already responding.
+                logger.info("LeKiwi: skipping speech (busy): %r", text)
+                return
+            if lock is None:
+                await self._session.generate_reply(instructions=f"Say: '{text}'")
+                return
+            async with lock:
+                await self._session.generate_reply(instructions=f"Say: '{text}'")
         except Exception as e:
             logger.exception(f"LeKiwi: failed to speak: {e}")
 

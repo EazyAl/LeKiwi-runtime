@@ -73,6 +73,7 @@ class LeTars(Agent):
             self.camera_hub = CameraHub(
                 front_index=front_camera_index,
                 wrist_index=wrist_camera_index,
+                top_index=None,
                 fps=30,
             )
             self.camera_hub.start()
