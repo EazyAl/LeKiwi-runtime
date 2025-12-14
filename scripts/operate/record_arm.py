@@ -4,10 +4,14 @@ import os
 import sys
 import time
 
+from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
 from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from lerobot.teleoperators.so100_leader import SO100Leader, SO100LeaderConfig
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.robot_utils import precise_sleep
+
+from lekiwi.robot import LeKiwi
 
 
 def main():
@@ -15,10 +19,28 @@ def main():
         description="Record an action sequence for LeKiwi's leader arm"
     )
     parser.add_argument(
+        "--connect",
+        choices=["auto", "host", "direct"],
+        default="auto",
+        help="How to connect to the robot. 'host' requires lekiwi/lerobot host running. "
+        "'direct' uses local USB serial. 'auto' tries host then falls back to direct.",
+    )
+    parser.add_argument(
         "--ip", type=str, default="172.20.10.2", help="Remote IP for the LeKiwi robot"
     )
     parser.add_argument(
         "--id", type=str, default="biden_kiwi", help="ID of the LeKiwi robot"
+    )
+    parser.add_argument(
+        "--robot-port",
+        type=str,
+        default="/dev/tty.usbmodem58760432781",
+        help="Serial port for the LeKiwi robot (direct mode only)",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Run motor calibration on connect (direct mode only). Default: off.",
     )
     parser.add_argument("--name", type=str, required=True, help="Name of the recording")
     parser.add_argument(
@@ -41,10 +63,24 @@ def main():
     )
     args = parser.parse_args()
 
-    # Create the robot configuration
-    robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id, cameras={})
-    robot = LeKiwiClient(robot_config)
-    robot.connect()  # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
+    # Create and connect robot (host or direct USB).
+    robot = None
+    if args.connect in ("host", "auto"):
+        try:
+            robot_config = LeKiwiClientConfig(remote_ip=args.ip, id=args.id, cameras={})
+            robot = LeKiwiClient(robot_config)
+            robot.connect()
+        except DeviceNotConnectedError:
+            if args.connect == "host":
+                raise
+            # Fall back to direct mode when no host is running.
+            robot = None
+
+    if robot is None:
+        robot_config = LeKiwiConfig(port=args.robot_port, id=args.id, cameras={})
+        robot = LeKiwi(robot_config)
+        # Default calibrate=False to avoid interactive prompts during recording.
+        robot.connect(calibrate=bool(args.calibrate))
 
     leader_arm_config = SO100LeaderConfig(port=args.port, id=args.leader_id)
     leader_arm = SO100Leader(leader_arm_config)
@@ -52,8 +88,9 @@ def main():
 
     input("Press Enter to start recording...")
 
+    # Save into the repo's lekiwi/recordings/arm folder.
     recordings_dir = os.path.join(
-        os.path.dirname(__file__), "..", "lekiwi", "recordings", "arm"
+        os.path.dirname(__file__), "..", "..", "lekiwi", "recordings", "arm"
     )
     os.makedirs(recordings_dir, exist_ok=True)
 
@@ -104,7 +141,11 @@ def main():
         except KeyboardInterrupt:
             print("Shutting down teleop...")
         finally:
-            robot.disconnect()
+            try:
+                if robot is not None:
+                    robot.disconnect()
+            except Exception:
+                pass
             if leader_arm is not None:
                 leader_arm.disconnect()
             print(f"Recording saved to {csv_filename}")

@@ -470,7 +470,7 @@ class LeTars(Agent):
         Don't just talk, MOVE!
 
         You have the following recordings available:
-        - For arms: greeting, wake_up
+        - For arm: excited_wiggle, greeting, headshake, idle, nod, sad, scanning, wake_up
         - For wheels: charge_forwards, spin, wiggle
 
         Args:
