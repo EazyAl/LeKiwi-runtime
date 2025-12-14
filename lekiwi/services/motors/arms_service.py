@@ -10,21 +10,38 @@ from lekiwi.robot import LeKiwi
 class ArmsService:
     def __init__(
         self,
-        port: str,
-        robot_id: str,
+        port: str | None = None,
+        robot_id: str | None = None,
+        robot: LeKiwi = None,
+        robot_lock: threading.Lock = None,
         fps: int = 30,
-        duration: float = 5.0,
+        duration: float = 0.6,
         idle_recording: str = "idle",
     ):
-        self.port = port
-        self.robot_id = robot_id
+        if robot is not None:
+            # Use provided robot instance (shared connection)
+            self.robot = robot
+            self.robot_lock = robot_lock if robot_lock is not None else threading.Lock()
+            self._owns_robot = False
+            self.port = None
+            self.robot_id = None
+        else:
+            # Create own robot connection (backward compatibility)
+            if port is None or robot_id is None:
+                raise ValueError(
+                    "Either robot instance or (port, robot_id) must be provided"
+                )
+            self.robot = None
+            self._owns_robot = True
+            self.port = port
+            self.robot_id = robot_id
+            self.robot_lock = threading.Lock()  # Own lock if creating own connection
+            self.robot_config = LeKiwiConfig(
+                port=port, id=robot_id, cameras={}
+            )  # TODO: add cameras later if needed
         self.fps = fps
         self.duration = duration
         self.idle_recording = idle_recording
-        self.robot_config = LeKiwiConfig(
-            port=port, id=robot_id, cameras={}
-        )  # TODO: add cameras later if needed
-        self.robot: LeKiwi | None = None
         self.recordings_dir = os.path.join(
             os.path.dirname(__file__), "..", "..", "recordings", "arm"
         )
@@ -36,26 +53,40 @@ class ArmsService:
         self._current_frame_index: int = 0
         self._current_actions: List[Dict[str, float]] = []
         self._interpolation_frames: int = 0
+        self._interpolation_total_frames: int = 0
         self._interpolation_target: Optional[Dict[str, float]] = None
 
         # Custom event handling
         self._running = threading.Event()
+        self._paused = threading.Event()  # For temporarily pausing playback
         self._event_queue = []
         self._event_lock = threading.Lock()
         self._event_thread: Optional[threading.Thread] = None
 
-    def start(self):
-        self.robot = LeKiwi(self.robot_config)
-        self.robot.connect(calibrate=False)
-        print(f"Arms service connected to {self.port}")
+    def start(self, *, start_idle: bool = True, preload: Optional[List[str]] = None):
+        if self._owns_robot:
+            self.robot = LeKiwi(self.robot_config)
+            self.robot.connect(calibrate=False)
+            print(f"Arms service connected to {self.port}")
+        else:
+            print("Arms service using shared robot connection")
+
+        # Preload recordings into memory to avoid disk IO on first play.
+        if preload:
+            for name in preload:
+                try:
+                    self._load_recording(name)
+                except Exception as e:
+                    print(f"Arms service failed to preload '{name}': {e}")
 
         # Start event processing thread
         self._running.set()
         self._event_thread = threading.Thread(target=self._event_loop, daemon=True)
         self._event_thread.start()
 
-        # Initialize with idle recording via self dispatch
-        self.dispatch("play", self.idle_recording)
+        # Initialize with idle recording via self dispatch (optional)
+        if start_idle:
+            self.dispatch("play", self.idle_recording)
 
     def stop(self, timeout: float = 5.0):
         # Stop event processing
@@ -63,7 +94,7 @@ class ArmsService:
         if self._event_thread and self._event_thread.is_alive():
             self._event_thread.join(timeout=timeout)
 
-        if self.robot:
+        if self._owns_robot and self.robot:
             self.robot.disconnect()
             self.robot = None
 
@@ -76,9 +107,24 @@ class ArmsService:
         with self._event_lock:
             self._event_queue.append((event_type, payload))
 
+    def pause(self):
+        """Pause arm playback temporarily (e.g., during epipen administration)"""
+        self._paused.set()
+        print("Arms service paused")
+
+    def resume(self):
+        """Resume arm playback after pause"""
+        self._paused.clear()
+        print("Arms service resumed")
+
     def _event_loop(self):
         """Custom event loop that supports interruption"""
         while self._running.is_set():
+            # Skip playback if paused (but still process events)
+            if self._paused.is_set():
+                time.sleep(0.05)  # Sleep while paused
+                continue
+
             # Check for events
             with self._event_lock:
                 if self._event_queue:
@@ -123,12 +169,13 @@ class ArmsService:
 
         # If we have a current state, set up interpolation to the first frame
         if self._current_state is not None:
-            self._interpolation_frames = int(self.duration * self.fps)
+            self._interpolation_total_frames = max(1, int(self.duration * self.fps))
+            self._interpolation_frames = self._interpolation_total_frames
             self._interpolation_target = actions[0]
         else:
             self._interpolation_frames = 0
+            self._interpolation_total_frames = 0
             self._interpolation_target = None
-
 
     def _continue_playback(self):
         """Continue current playback - called every frame"""
@@ -146,9 +193,8 @@ class ArmsService:
                 and self._interpolation_target is not None
             ):
                 # Calculate interpolation progress
-                progress = 1.0 - (
-                    self._interpolation_frames / (self.duration * self.fps)
-                )
+                total = max(1, int(self._interpolation_total_frames))
+                progress = 1.0 - (self._interpolation_frames / total)
                 progress = max(0.0, min(1.0, progress))
 
                 # Interpolate between current state and target
@@ -160,8 +206,9 @@ class ArmsService:
                         current_val + (target_val - current_val) * progress
                     )
 
-                # Send arm action directly using the new method
-                self.robot.send_arm_action(interpolated_action)
+                # Send arm action directly using the new method (with lock for thread safety)
+                with self.robot_lock:
+                    self.robot.send_arm_action(interpolated_action)
                 self._current_state = interpolated_action.copy()
                 self._interpolation_frames -= 1
                 return
@@ -169,8 +216,9 @@ class ArmsService:
             # Play current frame
             if self._current_frame_index < len(self._current_actions):
                 action = self._current_actions[self._current_frame_index]
-                # Send arm action directly using the new method
-                self.robot.send_arm_action(action)
+                # Send arm action directly using the new method (with lock for thread safety)
+                with self.robot_lock:
+                    self.robot.send_arm_action(action)
                 self._current_state = action.copy()
                 self._current_frame_index += 1
             else:
@@ -184,7 +232,12 @@ class ArmsService:
                         self._current_frame_index = 0
                         # Set up interpolation back to idle
                         if self._current_state is not None:
-                            self._interpolation_frames = int(self.duration * self.fps)
+                            self._interpolation_total_frames = max(
+                                1, int(self.duration * self.fps)
+                            )
+                            self._interpolation_frames = (
+                                self._interpolation_total_frames
+                            )
                             self._interpolation_target = idle_actions[0]
                 else:
                     # Loop idle recording
@@ -223,8 +276,7 @@ class ArmsService:
         csv_path = os.path.join(self.recordings_dir, csv_filename)
 
         if not os.path.exists(csv_path):
-            print(f"Recording not found: {csv_path}")
-            return None
+            raise FileNotFoundError(f"Recording not found: {csv_path}")
 
         try:
             with open(csv_path, "r") as csvfile:

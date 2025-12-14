@@ -264,10 +264,39 @@ class WorkflowService:
                                 # Note: self_instance is the agent instance passed by LiveKit
                                 # CRITICAL: bind the current tool function via default arg to avoid late-binding
                                 # closure bugs when defining this wrapper inside a loop.
+                                try:
+                                    if hasattr(self_instance, "viz"):
+                                        self_instance.viz.log_tool_call(
+                                            __tool_func.__name__,
+                                            "call",
+                                            level="info",
+                                            emoji="🧰",
+                                        )
+                                except Exception:
+                                    pass
+
                                 result = __tool_func(self_instance, *args, **kwargs)
                                 # Ensure we await if it's a coroutine
                                 if inspect.iscoroutine(result):
-                                    return await result
+                                    result = await result
+
+                                try:
+                                    if hasattr(self_instance, "viz"):
+                                        level = (
+                                            "error"
+                                            if isinstance(result, str)
+                                            and result.lower().startswith("error")
+                                            else "info"
+                                        )
+                                        self_instance.viz.log_tool_call(
+                                            __tool_func.__name__,
+                                            str(result),
+                                            level=level,
+                                            emoji="🧰",
+                                        )
+                                except Exception:
+                                    pass
+
                                 return result
 
                             # Copy all important attributes from original function

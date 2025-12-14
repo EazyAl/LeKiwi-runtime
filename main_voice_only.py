@@ -64,7 +64,7 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     await session.generate_reply(
-        instructions=f"""When you wake up, greet with: 'Systems nominal. Radio check complete. Over.'"""
+        instructions=f"""When you wake up, greet with: 'Hello.'"""
     )
 
 

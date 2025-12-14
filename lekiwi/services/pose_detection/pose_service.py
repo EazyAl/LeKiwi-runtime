@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import collections
 import time
-import threading
-import logging
 from dataclasses import dataclass
-from typing import Callable, Optional, Any, Dict
+from typing import Callable, Optional, Any, Dict, Tuple
 
 import cv2
 import mediapipe as mp
+import numpy as np
 
 # Assuming these are available from your common service files
-from ..base import ServiceBase, Priority, ServiceEvent
+from ..base import ServiceBase
 from ...vision import FrameRingBuffer, compute_quality_metrics
+from lekiwi.viz.rerun_viz import NullViz
+
+_WARNED_OPENCV_GUI = False
 
 
 @dataclass
@@ -31,7 +33,11 @@ class CameraStream:
         self.cap: Optional[cv2.VideoCapture] = None
 
     def start(self) -> None:
-        self.cap = cv2.VideoCapture(self.index)
+        # Prefer V4L2 on Linux to avoid OpenCV selecting an unexpected backend.
+        try:
+            self.cap = cv2.VideoCapture(int(self.index), cv2.CAP_V4L2)
+        except Exception:
+            self.cap = cv2.VideoCapture(self.index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {self.index}")
 
@@ -63,7 +69,17 @@ class PoseEstimator:
         return self.pose.process(rgb)
 
     def close(self) -> None:
-        self.pose.close()
+        # MediaPipe raises if close() is called twice (internal graph becomes None).
+        # Make this idempotent so orchestrators can safely stop services multiple times.
+        if self.pose is None:
+            return
+        try:
+            self.pose.close()
+        except ValueError:
+            # "Closing SolutionBase._graph which is already None"
+            pass
+        finally:
+            self.pose = None
 
 
 class FallDetector:
@@ -114,30 +130,36 @@ class PoseDetectionService(ServiceBase):
 
     def __init__(
         self,
-        camera: CameraStream,
-        pose: PoseEstimator,
-        detector: FallDetector,
-        # Renamed to match the callback style discussed previously
         status_callback: EventHandler,
+        camera: Optional[CameraStream] = None,
+        pose: Optional[PoseEstimator] = None,
+        detector: Optional[FallDetector] = None,
         visualizer: Optional[VisualizerFn] = None,
         target_width: Optional[int] = None,
         frame_skip: int = 1,
+        viz=None,
+        frame_subscription: Optional[Any] = None,
     ) -> None:
         super().__init__("pose_detection")
 
-        # Core components
-        self.camera = camera
-        self.pose = pose
-        self.detector = detector
+        # Core components - create defaults if not provided
+        self.camera = camera if camera is not None else CameraStream()
+        self.pose = pose if pose is not None else PoseEstimator()
+        self.detector = detector if detector is not None else FallDetector()
         self.status_callback = status_callback  # The function to call back to LeKiwi
         self.visualizer = visualizer
         self.ring_buffer = FrameRingBuffer(max_seconds=10.0, maxlen=300)
         self._prev_gray = None
+        self.viz = viz if viz is not None else NullViz()
+        # Optional external frame source (e.g., CameraHub subscription)
+        self.frame_subscription = frame_subscription
+        self._use_external_frames = frame_subscription is not None
 
         # State and configuration
         self.prev_is_fall_state = False  # Replaces self.prev_state
         self.target_width = target_width
         self.frame_skip = max(0, frame_skip)
+        self._fall_freeze_until = 0.0
 
         # Variables for event loop (initialized in _event_loop)
         self._frame_idx = 0
@@ -168,11 +190,12 @@ class PoseDetectionService(ServiceBase):
     # 1. Override start() to initialize resources
     def start(self):
         """Starts camera and worker thread."""
-        try:
-            self.camera.start()
-        except RuntimeError as e:
-            self.logger.error(f"Failed to start camera: {e}")
-            return
+        if not self._use_external_frames:
+            try:
+                self.camera.start()
+            except RuntimeError as e:
+                self.logger.error(f"Failed to start camera: {e}")
+                return
 
         super().start()
         self.logger.info("Pose Detection Service started")
@@ -181,7 +204,8 @@ class PoseDetectionService(ServiceBase):
     def stop(self, timeout: float = 5.0):
         """Stops worker thread, camera, and pose model."""
         super().stop(timeout)  # Stop the worker thread first
-        self.camera.stop()
+        if not self._use_external_frames:
+            self.camera.stop()
         self.pose.close()
         cv2.destroyAllWindows()
         self.logger.info("Pose Detection Service stopped")
@@ -221,8 +245,18 @@ class PoseDetectionService(ServiceBase):
                         self._event_available.clear()
             # ------------------------------------------------------------------
 
+            frame_ts = time.time()
             try:
-                frame = self.camera.read()
+                if self._use_external_frames and self.frame_subscription:
+                    pulled: Optional[Tuple[float, np.ndarray]] = (
+                        self.frame_subscription.pull(timeout=0.1)
+                    )
+                    if pulled is None:
+                        continue
+                    frame_ts, frame = pulled
+                else:
+                    frame = self.camera.read()
+                    frame_ts = time.time()
             except RuntimeError:
                 self.logger.error("Camera frame read failed. Stopping service.")
                 self.stop()
@@ -238,34 +272,59 @@ class PoseDetectionService(ServiceBase):
             if process_this:
                 infer_frame = self._resize_for_infer(frame)
                 result = self.pose.infer(infer_frame)
-                landmarks = result.pose_landmarks.landmark if result and result.pose_landmarks else None
+                landmarks = (
+                    result.pose_landmarks.landmark
+                    if result and result.pose_landmarks
+                    else None
+                )
                 quality = compute_quality_metrics(
-                    frame, self._prev_gray, landmarks, downscale_width=self.target_width or 320
+                    frame,
+                    self._prev_gray,
+                    landmarks,
+                    downscale_width=self.target_width or 320,
                 )
                 gray = quality.pop("gray", None)
                 self._prev_gray = gray
 
                 if landmarks:
                     event = self.detector.detect(landmarks)
-                    if event:
-                        is_fall = event.is_fall
-                        # --- Event Emission Logic ---
-                        if is_fall != self.prev_is_fall_state:
-                            # 4. Use the status_callback to notify LeKiwi (the orchestrator)
-                            event_data = {
-                                "score": event.score,
-                                "ratio": event.ratio,
-                                "timestamp": event.timestamp,
-                                "quality": quality,
-                            }
-                            event_type = "PERSON_FALLEN" if is_fall else "PERSON_STABLE"
-                            self.status_callback(event_type, event_data)
 
-                        self.prev_is_fall_state = is_fall
-                    else:
-                        self.prev_is_fall_state = False  # No landmarks, assume no event
+                # Determine raw detection result
+                detected_fall = False
+                if event:
+                    detected_fall = event.is_fall
+
+                # Apply freeze logic
+                if time.time() < self._fall_freeze_until:
+                    is_fall = True
                 else:
-                    self.prev_is_fall_state = False  # No pose detected
+                    is_fall = detected_fall
+                    if is_fall:
+                        self._fall_freeze_until = time.time() + 3.0
+
+                if is_fall != self.prev_is_fall_state:
+                    # Prepare event data
+                    if event:
+                        event_data = {
+                            "score": event.score,
+                            "ratio": event.ratio,
+                            "timestamp": event.timestamp,
+                            "quality": quality,
+                        }
+                    else:
+                        # Fallback if frozen but no current event
+                        evt = self._last_fall_event
+                        event_data = {
+                            "score": evt.score if evt else 1.0,
+                            "ratio": evt.ratio if evt else 0.0,
+                            "timestamp": time.time(),
+                            "quality": quality,
+                        }
+
+                    event_type = "PERSON_FALLEN" if is_fall else "PERSON_STABLE"
+                    self.status_callback(event_type, event_data)
+
+                self.prev_is_fall_state = is_fall
                 self._last_fall_event = event or self._last_fall_event
                 self._last_is_fall = is_fall
 
@@ -276,7 +335,7 @@ class PoseDetectionService(ServiceBase):
                         buf_frame,
                         landmarks,
                         quality,
-                        ts=event.timestamp if event else time.time(),
+                        ts=event.timestamp if event else frame_ts,
                     )
                 except Exception as e:
                     self.logger.debug(f"Ring buffer add failed: {e}")
@@ -284,6 +343,32 @@ class PoseDetectionService(ServiceBase):
             now = time.time()
             fps = 1.0 / max(now - self._prev_time, 1e-6)
             self._prev_time = now
+
+            # Emit pose landmarks to viz (thread-safe via event queue)
+            if self.viz:
+                try:
+                    self.viz.log_front_rgb(frame, frame_ts)
+                except Exception as e:
+                    self.logger.debug(f"Viz front log failed: {e}")
+
+            if result and result.pose_landmarks and self.viz:
+                h, w = frame.shape[:2]
+                pts = np.array(
+                    [(lm.x * w, lm.y * h) for lm in result.pose_landmarks.landmark],
+                    dtype=np.float32,
+                )
+                vis = np.array(
+                    [
+                        getattr(lm, "visibility", 0.0)
+                        for lm in result.pose_landmarks.landmark
+                    ],
+                    dtype=np.float32,
+                )
+                edges = list(mp.solutions.pose.POSE_CONNECTIONS)
+                try:
+                    self.viz.log_pose(pts, edges=edges, vis=vis, ts=frame_ts)
+                except Exception as e:
+                    self.logger.debug(f"Viz pose log failed: {e}")
 
             # Visualization (runs on every frame read, regardless of frame_skip)
             event_for_vis = event or self._last_fall_event
@@ -357,5 +442,20 @@ def default_visualizer(
         (255, 255, 255),
         2,
     )
-    cv2.imshow("Fall Detection (MediaPipe Pose)", frame)
-    return bool(cv2.waitKey(1) & 0xFF == ord("q"))
+    try:
+        cv2.imshow("Fall Detection (MediaPipe Pose)", frame)
+        return bool(cv2.waitKey(1) & 0xFF == ord("q"))
+    except cv2.error as e:
+        # OpenCV GUI not available (headless mode, worker thread on macOS, etc.)
+        # We warn once so users don't think it's "just stuck".
+        global _WARNED_OPENCV_GUI
+        if not _WARNED_OPENCV_GUI:
+            _WARNED_OPENCV_GUI = True
+            print(
+                "[pose_service] OpenCV window could not be opened. "
+                "This commonly happens on macOS when cv2.imshow() is called from a background thread "
+                "(PoseDetectionService runs in a worker thread). "
+                "To verify the camera feed, run `uv run scripts/test_pose_detection.py` "
+                "and set POSE_CAMERA_INDEX=...; then use the same POSE_CAMERA_INDEX for main_workflows."
+            )
+        return False

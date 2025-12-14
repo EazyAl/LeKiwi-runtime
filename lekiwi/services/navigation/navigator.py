@@ -4,9 +4,14 @@ Navigation module for LeKiwi robot - handles person detection, alignment, and ap
 
 import cv2
 import time
+import threading
+from typing import Optional, Tuple, Any
 import torch
 import numpy as np
 import mediapipe as mp
+import os
+
+from lekiwi.viz.rerun_viz import NullViz
 
 # LeKiwi imports
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
@@ -29,20 +34,45 @@ class Navigator:
     Designed to be called synchronously from workflow tools.
     """
 
-    def __init__(self, robot):
+    def __init__(
+        self,
+        robot,
+        robot_lock: Optional[threading.Lock] = None,
+        viz=None,
+        frame_subscription: Optional[Any] = None,
+    ):
         """
         Initialize navigator with robot instance.
 
         Args:
             robot: Connected LeKiwi robot instance
+            robot_lock: Optional lock to serialize robot motor access (for thread safety)
         """
         self.robot = robot
+        self.robot_lock = robot_lock if robot_lock is not None else threading.Lock()
+        self.viz = viz if viz is not None else NullViz()
+        self.frame_subscription = frame_subscription
+        self._use_external_frames = frame_subscription is not None
 
         # Initialize components
         self.pose_estimator = PoseEstimator()
         self.mono_pilot = MonoPilot()
-        self.cap = cv2.VideoCapture(0)  # Use camera 0 for workflow integration
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Camera selection:
+        # - Prefer NAV_CAMERA_INDEX if set
+        # - Otherwise reuse POSE_CAMERA_INDEX if set (so workflows + pose agree)
+        # - Default to 0
+        nav_cam = os.getenv("NAV_CAMERA_INDEX")
+        pose_cam = os.getenv("POSE_CAMERA_INDEX")
+        cam_index = int(
+            nav_cam
+            if nav_cam is not None
+            else (pose_cam if pose_cam is not None else "0")
+        )
+
+        self.cap = None
+        if not self._use_external_frames:
+            self.cap = cv2.VideoCapture(cam_index)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         # Navigation parameters (can be made configurable later)
         self.target_distance = 75.0  # cm
@@ -77,7 +107,15 @@ class Navigator:
         except Exception as e:
             return f"Navigation failed: {str(e)}"
         finally:
-            self.cap.release()
+            # Always attempt to stop the base if we may have been driving.
+            # This mirrors `nav/nav.py` behavior where stopping is explicit.
+            try:
+                with self.robot_lock:
+                    self.robot.stop_base()
+            except Exception as e:
+                print(f"Warning: failed to stop base during navigation cleanup: {e}")
+            if self.cap is not None:
+                self.cap.release()
 
     def _find_and_align_person(self) -> bool:
         """
@@ -91,10 +129,10 @@ class Navigator:
         last_tracked_side = None
 
         while time.time() - start_time < self.alignment_timeout:
-            ok, frame = self.cap.read()
-            if not ok:
-                print("Camera read failed during alignment")
-                return False
+            pulled = self._pull_frame(timeout=0.2)
+            if pulled is None:
+                continue
+            frame_ts, frame = pulled
 
             h, w = frame.shape[:2]
 
@@ -129,19 +167,21 @@ class Navigator:
                     return True
 
                 # Rotate towards the person
+                # Note: rotation sign flipped because front camera is upside down
                 rotation_angle = self._pixels_to_angle(offset_pixels, w)
-                rotation_speed = -rotation_angle * self.rotation_kp
+                rotation_speed = rotation_angle * self.rotation_kp
                 rotation_speed = np.clip(rotation_speed, -20.0, 20.0)
 
-                # Send rotation command
+                # Send rotation command (with lock for thread safety)
                 try:
-                    self.robot.send_base_action(
-                        {
-                            "x.vel": 0.0,
-                            "y.vel": 0.0,
-                            "theta.vel": rotation_speed,
-                        }
-                    )
+                    with self.robot_lock:
+                        self.robot.send_base_action(
+                            {
+                                "x.vel": 0.0,
+                                "y.vel": 0.0,
+                                "theta.vel": rotation_speed,
+                            }
+                        )
                 except Exception as e:
                     print(f"Error sending rotation command: {e}")
                     return False
@@ -150,7 +190,7 @@ class Navigator:
             time.sleep(0.05)
 
         # Timeout
-        print(".1f")
+        print(f"Alignment timeout after {self.alignment_timeout:.1f}s")
         return False
 
     def _approach_to_safe_distance(self) -> bool:
@@ -164,45 +204,99 @@ class Navigator:
         consecutive_below_threshold = 0
 
         while True:
-            ok, frame = self.cap.read()
-            if not ok:
-                print("Camera read failed during approach")
-                return False
+            pulled = self._pull_frame(timeout=0.2)
+            if pulled is None:
+                continue
+            frame_ts, frame = pulled
 
             # Get depth information
             vx, vy, omega, depth_map, scores = self.mono_pilot.process_frame(frame)
+            try:
+                if self.viz:
+                    self.viz.log_depth(depth_map, frame_ts)
+            except Exception:
+                pass
 
             # Calculate distance
             mode_depth = self._get_mode_distance(depth_map)
             mode_distance = self._estimate_distance_from_depth(mode_depth)
 
+            # Publish depth for viz (on-demand during navigation)
+            try:
+                self._log_depth(depth_map)
+            except Exception:
+                pass
+
             # Check distance condition
-            if mode_distance < 60.0:
+            # Stop when we are at/inside the target distance.
+            if mode_distance <= self.target_distance:
                 consecutive_below_threshold += 1
-                print(".1f")
+                print(
+                    f"Close distance detected ({mode_distance:.1f}cm) - "
+                    f"{consecutive_below_threshold}/{self.consecutive_frames} frames"
+                )
             else:
                 consecutive_below_threshold = 0  # Reset counter
 
             # Check if we've reached the target
             if consecutive_below_threshold >= self.consecutive_frames:
-                print(".1f")
+                # Explicitly stop the base before returning success, otherwise the last
+                # velocity command keeps the robot moving.
+                try:
+                    with self.robot_lock:
+                        self.robot.stop_base()
+                except Exception as e:
+                    print(f"Warning: failed to stop base at target distance: {e}")
+                print(
+                    f"Target reached at {mode_distance:.1f}cm after "
+                    f"{consecutive_below_threshold} consecutive frames"
+                )
                 return True
 
-            # Continue driving forward
+            # Continue driving forward (with lock for thread safety)
             try:
-                self.robot.send_base_action(
-                    {
-                        "x.vel": self.drive_speed,
-                        "y.vel": 0.0,
-                        "theta.vel": 0.0,
-                    }
-                )
+                with self.robot_lock:
+                    self.robot.send_base_action(
+                        {
+                            "x.vel": self.drive_speed,
+                            "y.vel": 0.0,
+                            "theta.vel": 0.0,
+                        }
+                    )
             except Exception as e:
                 print(f"Error sending drive command: {e}")
+                # Try to stop if sending drive failed mid-approach
+                try:
+                    with self.robot_lock:
+                        self.robot.stop_base()
+                except Exception as stop_e:
+                    print(
+                        f"Warning: also failed to stop base after drive error: {stop_e}"
+                    )
                 return False
 
             # Small delay
             time.sleep(0.05)
+
+    def _pull_frame(self, timeout: float = 0.1) -> Optional[Tuple[float, np.ndarray]]:
+        """
+        Get a frame either from an external subscription or the local cv2 camera.
+        Returns (ts, frame) or None if unavailable.
+        """
+        if self._use_external_frames and self.frame_subscription:
+            pulled = self.frame_subscription.pull(timeout=timeout)
+            if pulled is None:
+                return None
+            return pulled
+
+        if self.cap is None:
+            return None
+
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            print("Camera read failed during navigation")
+            return None
+        return time.time(), frame
 
     def _calculate_thigh_midpoint(self, landmarks, frame_width, frame_height):
         """
@@ -383,3 +477,18 @@ class Navigator:
         mode_depth = (bin_edges[mode_bin_idx] + bin_edges[mode_bin_idx + 1]) / 2
 
         return mode_depth
+
+    def _log_depth(self, depth_map: np.ndarray):
+        """Publish depth map to viz using the same MiDaS output."""
+        if depth_map is None:
+            return
+        try:
+            depth_norm = cv2.normalize(
+                depth_map, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
+            )
+            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_MAGMA)
+            ts = time.time()
+            self.viz.log_depth(depth_color, ts=ts)
+        except Exception:
+            # Best-effort; do not break navigation
+            pass
