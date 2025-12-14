@@ -13,10 +13,11 @@ import numpy as np
 import argparse
 import mediapipe as mp
 import os
+import threading
 
 import logging
 import sys
-from typing import Optional
+from typing import Optional, Tuple, Any
 
 # Configure logging
 logging.basicConfig(
@@ -29,8 +30,8 @@ from lekiwi.robot.lekiwi import LeKiwi
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 from lekiwi.services.pose_detection.pose_service import PoseEstimator
 
-# Import MonoPilot from combined_viewer
-from nav.combined_viewer import MonoPilot
+# Import MonoPilot from combined_viewer (package-relative import)
+from .combined_viewer import MonoPilot
 
 # MediaPipe pose landmark indices
 LEFT_HIP = 23
@@ -249,6 +250,446 @@ def get_mode_distance(depth_map, center_region_ratio=0.3, bin_size=10):
     return mode_depth
 
 
+class CombinedNavigator:
+    """
+    Importable navigation helper based on this script's logic (align to thigh, then approach).
+
+    Designed for orchestrators like `sentry.py`:
+    - No argparse / no OpenCV UI
+    - Can consume frames from a `CameraHub` subscription (preferred), or open its own cv2 camera.
+    """
+
+    def __init__(
+        self,
+        robot: Any,
+        *,
+        robot_lock: Optional[Any] = None,
+        frame_subscription: Optional[Any] = None,
+        rotate_180: bool = True,
+        viz: Optional[Any] = None,
+        camera_index: Optional[int] = None,
+    ) -> None:
+        self.robot = robot
+        self.robot_lock = robot_lock
+        self.frame_subscription = frame_subscription
+        self._use_external_frames = frame_subscription is not None
+        self.rotate_180 = rotate_180
+        self.viz = viz
+
+        # Models
+        self.pose = PoseEstimator()
+        self.mono_pilot = MonoPilot()
+
+        # Tracking state (updated by `track_step`; can be used as a warm-start for navigation)
+        self._track_lock = threading.Lock()
+        self._track_ts: Optional[float] = None
+        self._track_frame_shape: Optional[Tuple[int, int]] = None  # (h, w)
+        self._track_side: Optional[str] = None
+        self._track_conf: float = 0.0
+        self._track_thigh_xy: Optional[Tuple[float, float]] = None
+        self._track_offset_norm: float = 0.0
+        self._track_est_distance_cm: Optional[float] = None
+
+        # Local camera (only if we are not provided external frames)
+        self.cap: Optional[cv2.VideoCapture] = None
+        if not self._use_external_frames:
+            if camera_index is None:
+                # Prefer env override; fall back to the historic default used by this script.
+                camera_index = int(os.getenv("NAV_CAMERA_INDEX", "4"))
+            self.cap = cv2.VideoCapture(int(camera_index))
+            try:
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
+
+    # --- Tracking-only mode (no driving) ---
+    def track_step(self, frame_bgr: np.ndarray, ts: Optional[float] = None) -> None:
+        """
+        Update internal tracking estimates from a frame.
+
+        This method NEVER commands the robot. It is meant to run continuously so models stay
+        warm and we have a last-known thigh position/offset and approximate distance ready
+        when a fall event triggers navigation.
+        """
+        if frame_bgr is None:
+            return
+        if ts is None:
+            ts = time.time()
+
+        frame = self._maybe_rotate(frame_bgr)
+        h, w = frame.shape[:2]
+
+        # Pose-based thigh tracking
+        result = self.pose.infer(frame)
+        landmarks = (
+            result.pose_landmarks.landmark if result and result.pose_landmarks else None
+        )
+        thigh_x, thigh_y, conf, side = calculate_thigh_midpoint(landmarks, w, h)
+        _offset_px, offset_norm = calculate_thigh_offset(thigh_x, w)
+
+        # Depth-based distance (sample around thigh midpoint when possible)
+        est_cm: Optional[float] = None
+        try:
+            _, _, _, depth_map, _scores = self.mono_pilot.process_frame(frame)
+            use_x = thigh_x
+            use_y = thigh_y
+            if use_x is not None and use_y is not None:
+                tx, ty = int(use_x), int(use_y)
+                y_min, y_max = max(0, ty - 5), min(h, ty + 5)
+                x_min, x_max = max(0, tx - 5), min(w, tx + 5)
+                region = depth_map[y_min:y_max, x_min:x_max]
+                if region.size > 0:
+                    depth_val = float(np.mean(region))
+                    est_cm = float(estimate_distance_from_depth(depth_val))
+            # Optional best-effort viz
+            self._log_depth_best_effort(depth_map, ts)
+        except Exception:
+            est_cm = None
+
+        with self._track_lock:
+            self._track_ts = ts
+            self._track_frame_shape = (h, w)
+            if side:
+                self._track_side = side
+            self._track_conf = float(conf or 0.0)
+            if thigh_x is not None and thigh_y is not None:
+                self._track_thigh_xy = (float(thigh_x), float(thigh_y))
+            self._track_offset_norm = float(offset_norm or 0.0)
+            if est_cm is not None:
+                self._track_est_distance_cm = float(est_cm)
+
+    def get_tracking_snapshot(self) -> dict:
+        """Return a shallow snapshot of the last tracking values (for logging/debug)."""
+        with self._track_lock:
+            return {
+                "ts": self._track_ts,
+                "frame_shape": self._track_frame_shape,
+                "side": self._track_side,
+                "conf": self._track_conf,
+                "thigh_xy": self._track_thigh_xy,
+                "offset_norm": self._track_offset_norm,
+                "est_distance_cm": self._track_est_distance_cm,
+            }
+
+    def center_person_step(
+        self,
+        *,
+        rotation_kp: float = 1.5,
+        rotation_deadzone: float = 0.08,
+        max_theta_vel: float = 20.0,
+        min_conf: float = 0.5,
+        tracking_fresh_s: float = 0.5,
+    ) -> bool:
+        """
+        Use the most recent tracking snapshot to rotate the robot base to keep the
+        person centered. This method ONLY rotates (no translation).
+
+        Returns:
+            bool: True if a command was sent, False otherwise.
+        """
+        snap = self.get_tracking_snapshot()
+        ts = snap.get("ts")
+        shape = snap.get("frame_shape")
+        conf = float(snap.get("conf") or 0.0)
+        off_norm = float(snap.get("offset_norm") or 0.0)
+
+        if ts is None or shape is None:
+            return False
+        try:
+            if (time.time() - float(ts)) > tracking_fresh_s:
+                return False
+        except Exception:
+            return False
+
+        if conf < min_conf:
+            # Don't hunt/oscillate on low-confidence detections.
+            self._send_base_action({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+            return False
+
+        if abs(off_norm) <= rotation_deadzone:
+            # Already centered: send explicit zero to prevent stale rotation commands.
+            self._send_base_action({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+            return True
+
+        h, w = shape
+        offset_pixels = off_norm * (float(w) / 2.0)
+        rotation_angle = pixels_to_angle(offset_pixels, float(w))
+        theta_vel = -rotation_angle * float(rotation_kp)
+        theta_vel = float(np.clip(theta_vel, -max_theta_vel, max_theta_vel))
+
+        self._send_base_action({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": theta_vel})
+        return True
+
+    def _pull_frame(self, timeout: float = 0.2) -> Optional[Tuple[float, np.ndarray]]:
+        if self._use_external_frames and self.frame_subscription:
+            pulled = self.frame_subscription.pull(timeout=timeout)
+            if pulled is None:
+                return None
+            return pulled
+
+        if self.cap is None:
+            return None
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return None
+        return time.time(), frame
+
+    def _maybe_rotate(self, frame: np.ndarray) -> np.ndarray:
+        if not self.rotate_180:
+            return frame
+        try:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        except Exception:
+            return frame
+
+    def _send_base_action(self, action: dict) -> None:
+        if self.robot_lock is None:
+            self.robot.send_base_action(action)
+            return
+        try:
+            with self.robot_lock:
+                self.robot.send_base_action(action)
+        except TypeError:
+            # If robot_lock isn't a context manager, fall back to unlocked.
+            self.robot.send_base_action(action)
+
+    def _stop_base(self) -> None:
+        if self.robot_lock is None:
+            self.robot.stop_base()
+            return
+        try:
+            with self.robot_lock:
+                self.robot.stop_base()
+        except TypeError:
+            self.robot.stop_base()
+
+    def _send_stop(self) -> None:
+        """
+        Prefer sending a zero-velocity command over `stop_base()` during normal operation.
+        `stop_base()` is still used for final cleanup as a safety net.
+        """
+        try:
+            self._send_base_action({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        except Exception:
+            pass
+
+    def _log_depth_best_effort(self, depth_map: np.ndarray, ts: float) -> None:
+        if self.viz is None or depth_map is None:
+            return
+        try:
+            depth_norm = cv2.normalize(
+                depth_map, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
+            )
+            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_MAGMA)
+            self.viz.log_depth(depth_color, ts=ts)
+        except Exception:
+            pass
+
+    def navigate_to_person(
+        self,
+        *,
+        target_distance_cm: float = 25.0,
+        drive_speed: float = 0.15,
+        rotation_kp: float = 1.5,
+        rotation_deadzone: float = 0.08,
+        consecutive_frames: int = 1,
+        alignment_timeout_s: float = 10.0,
+        approach_timeout_s: float = 6.5,
+        backoff_duration_s: float = 1.0,
+        hard_stop_on_finish: bool = False,
+        warm_start_from_tracking: bool = True,
+        tracking_fresh_s: float = 0.75,
+    ) -> str:
+        """
+        Align to a detected thigh, then drive forward until within target distance.
+
+        Returns a human-readable status string.
+        """
+        last_thigh_x = None
+        last_thigh_y = None
+        last_tracked_side = None
+        did_stop_base = False
+        success = False
+
+        try:
+            # --- Optional warm-start: if tracking is fresh + already aligned, skip alignment ---
+            if warm_start_from_tracking:
+                snap = self.get_tracking_snapshot()
+                snap_ts = snap.get("ts")
+                snap_off = snap.get("offset_norm", 0.0) or 0.0
+                if (
+                    isinstance(snap_ts, (int, float))
+                    and (time.time() - float(snap_ts)) <= tracking_fresh_s
+                    and abs(float(snap_off)) <= rotation_deadzone
+                ):
+                    # Already aligned recently; proceed to approach.
+                    pass
+                else:
+                    snap = None
+            else:
+                snap = None
+
+            # --- Phase 1: Alignment ---
+            start_align = time.monotonic()
+            if snap is None:
+                while (time.monotonic() - start_align) < alignment_timeout_s:
+                    pulled = self._pull_frame(timeout=0.2)
+                    if pulled is None:
+                        continue
+                    frame_ts, frame = pulled
+                    frame = self._maybe_rotate(frame)
+
+                    h, w = frame.shape[:2]
+                    result = self.pose.infer(frame)
+                    landmarks = (
+                        result.pose_landmarks.landmark
+                        if result and result.pose_landmarks
+                        else None
+                    )
+
+                    thigh_x, thigh_y, confidence, side = calculate_thigh_midpoint(
+                        landmarks, w, h
+                    )
+
+                    if side:
+                        last_tracked_side = side
+                    if thigh_x is not None and thigh_y is not None:
+                        last_thigh_x, last_thigh_y = thigh_x, thigh_y
+
+                    if thigh_x is None or confidence <= 0:
+                        time.sleep(0.03)
+                        continue
+
+                    offset_pixels, normalized_offset = calculate_thigh_offset(thigh_x, w)
+                    if abs(normalized_offset) <= rotation_deadzone:
+                        break
+
+                    rotation_angle = pixels_to_angle(offset_pixels, w)
+                    rotation_speed = -rotation_angle * rotation_kp
+                    rotation_speed = float(np.clip(rotation_speed, -20.0, 20.0))
+                    self._send_base_action(
+                        {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": rotation_speed}
+                    )
+                    time.sleep(0.05)
+                else:
+                    return "Alignment timeout - could not find/align to person"
+
+            # Stop any residual rotation before approach (avoid spamming stop_base logs)
+            self._send_stop()
+
+            # --- Phase 2: Approach ---
+            start_approach = time.monotonic()
+            below = 0
+            while True:
+                if (time.monotonic() - start_approach) > approach_timeout_s:
+                    # --- Phase 3: Safety backoff ---
+                    backoff_start = time.monotonic()
+                    while (time.monotonic() - backoff_start) < backoff_duration_s:
+                        self._send_base_action(
+                            {"x.vel": -abs(drive_speed), "y.vel": 0.0, "theta.vel": 0.0}
+                        )
+                        time.sleep(0.05)
+                    self._send_stop()
+                    return "Approach timeout - backed off for safety"
+
+                pulled = self._pull_frame(timeout=0.2)
+                if pulled is None:
+                    continue
+                frame_ts, frame = pulled
+                frame = self._maybe_rotate(frame)
+                h, w = frame.shape[:2]
+
+                # Update thigh tracking (best-effort)
+                result = self.pose.infer(frame)
+                landmarks = (
+                    result.pose_landmarks.landmark
+                    if result and result.pose_landmarks
+                    else None
+                )
+                thigh_x, thigh_y, confidence, side = calculate_thigh_midpoint(
+                    landmarks, w, h
+                )
+                if side:
+                    last_tracked_side = side
+                if thigh_x is not None and thigh_y is not None:
+                    last_thigh_x, last_thigh_y = thigh_x, thigh_y
+
+                # Depth inference
+                _, _, _, depth_map, _scores = self.mono_pilot.process_frame(frame)
+                self._log_depth_best_effort(depth_map, frame_ts)
+
+                # Sample depth around the thigh point (or last known)
+                use_x = thigh_x if thigh_x is not None else last_thigh_x
+                use_y = thigh_y if thigh_y is not None else last_thigh_y
+                if use_x is None or use_y is None:
+                    # No target point yet; keep creeping slowly forward.
+                    self._send_base_action(
+                        {"x.vel": drive_speed, "y.vel": 0.0, "theta.vel": 0.0}
+                    )
+                    time.sleep(0.05)
+                    continue
+
+                tx, ty = int(use_x), int(use_y)
+                y_min, y_max = max(0, ty - 5), min(h, ty + 5)
+                x_min, x_max = max(0, tx - 5), min(w, tx + 5)
+                region = depth_map[y_min:y_max, x_min:x_max]
+                if region.size == 0:
+                    self._send_base_action(
+                        {"x.vel": drive_speed, "y.vel": 0.0, "theta.vel": 0.0}
+                    )
+                    time.sleep(0.05)
+                    continue
+
+                depth_val = float(np.mean(region))
+                est_cm = float(estimate_distance_from_depth(depth_val))
+
+                if est_cm <= target_distance_cm:
+                    below += 1
+                else:
+                    below = 0
+
+                if below >= max(1, int(consecutive_frames)):
+                    self._send_stop()
+                    success = True
+                    return (
+                        f"Successfully navigated to person (side={last_tracked_side}, "
+                        f"distance={est_cm:.1f}cm)"
+                    )
+
+                # Continue approach
+                self._send_base_action(
+                    {"x.vel": drive_speed, "y.vel": 0.0, "theta.vel": 0.0}
+                )
+                time.sleep(0.05)
+
+        except Exception as e:
+            # Best-effort stop on error (avoid duplicates)
+            self._send_stop()
+            if not did_stop_base:
+                try:
+                    self._stop_base()
+                    did_stop_base = True
+                except Exception:
+                    pass
+            return f"Navigation failed: {e}"
+        finally:
+            # Best-effort cleanup:
+            # - Always send a 0-velocity command so the robot doesn't continue on stale commands.
+            # - Only issue a "hard stop" (stop_base) if requested or if we did not succeed.
+            self._send_stop()
+            if (hard_stop_on_finish or not success) and not did_stop_base:
+                try:
+                    self._stop_base()
+                    did_stop_base = True
+                except Exception:
+                    pass
+            try:
+                if self.cap is not None:
+                    self.cap.release()
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Combined navigation: align with thigh, then approach"
@@ -257,7 +698,7 @@ def main():
     parser.add_argument(
         "--port",
         type=str,
-        default="/dev/tty.usbmodem58760432781",
+        default="/dev/ttyACM0",
         help="Serial port for the robot",
     )
     parser.add_argument("--id", type=str, default="biden_kiwi", help="ID of the robot")
@@ -276,7 +717,7 @@ def main():
     parser.add_argument(
         "--rotation_kp",
         type=float,
-        default=1.5,
+        default=5,
         help="Proportional gain for thigh rotation control",
     )
     parser.add_argument(
@@ -386,7 +827,7 @@ def main():
     last_thigh_y = None
     consecutive_below_threshold = 0
     alignment_start_time = time.time()
-    alignment_timeout = 10.0  # Give up alignment after 10 seconds
+    alignment_timeout = 15.0  # Give up alignment after 10 seconds
 
     # Use monotonic time for safety timers (robust to system clock changes)
     approach_start_time = None

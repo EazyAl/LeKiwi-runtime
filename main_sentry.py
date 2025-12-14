@@ -611,16 +611,193 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
+        def _sounddevice_list_devices_once() -> None:
+            """
+            Optionally print PortAudio device list to help pick the correct mic on Linux.
+            Controlled by env var:
+              - LEKIWI_SD_LIST_DEVICES=1
+            """
+            if os.getenv("LEKIWI_SD_LIST_DEVICES", "0") != "1":
+                return
+            try:
+                import sounddevice as sd  # type: ignore
+
+                devices = sd.query_devices()
+                logger.info("sounddevice: default.device=%r", getattr(sd.default, "device", None))
+                for idx, d in enumerate(devices):
+                    try:
+                        name = str(d.get("name", ""))
+                        mi = int(d.get("max_input_channels", 0))
+                        mo = int(d.get("max_output_channels", 0))
+                        sr = d.get("default_samplerate", None)
+                        hostapi = d.get("hostapi", None)
+                        logger.info(
+                            "sounddevice[%d]: in=%d out=%d sr=%s hostapi=%s name=%r",
+                            idx,
+                            mi,
+                            mo,
+                            sr,
+                            hostapi,
+                            name,
+                        )
+                    except Exception:
+                        logger.info("sounddevice[%d]: %r", idx, d)
+            except Exception as e:
+                logger.warning("sounddevice: failed to list devices (%s)", e)
+
+        _sd_devices_listed = False
+
+        def _resolve_sounddevice(kind: str, spec: str) -> "int | None":
+            """
+            Resolve a PortAudio device by:
+              - integer index string: "3"
+              - name substring: "usb", "wm8960", "blue"
+            """
+            spec = (spec or "").strip()
+            if not spec:
+                return None
+            try:
+                return int(spec)
+            except Exception:
+                pass
+            try:
+                import sounddevice as sd  # type: ignore
+
+                spec_l = spec.lower()
+                devices = sd.query_devices()
+                for idx, d in enumerate(devices):
+                    name = str(d.get("name", "")).lower()
+                    if spec_l not in name:
+                        continue
+                    if kind == "input" and int(d.get("max_input_channels", 0)) > 0:
+                        return idx
+                    if kind == "output" and int(d.get("max_output_channels", 0)) > 0:
+                        return idx
+            except Exception:
+                return None
+            return None
+
+        def _apply_sounddevice_overrides() -> None:
+            """
+            Force sounddevice default devices (used by LiveKit console).
+
+            Env vars:
+              - LEKIWI_SD_INPUT_DEVICE: int index or name substring
+              - LEKIWI_SD_OUTPUT_DEVICE: int index or name substring
+              - LEKIWI_SD_DEVICE: sets both input+output (fallback)
+              - LEKIWI_SD_LIST_DEVICES=1: prints device list once at first use
+            """
+            nonlocal _sd_devices_listed
+            try:
+                import sounddevice as sd  # type: ignore
+            except Exception:
+                return
+
+            if not _sd_devices_listed:
+                _sounddevice_list_devices_once()
+                _sd_devices_listed = True
+
+            both = os.getenv("LEKIWI_SD_DEVICE", "").strip()
+            in_spec = os.getenv("LEKIWI_SD_INPUT_DEVICE", "").strip() or both
+            out_spec = os.getenv("LEKIWI_SD_OUTPUT_DEVICE", "").strip() or both
+
+            in_dev = _resolve_sounddevice("input", in_spec)
+            out_dev = _resolve_sounddevice("output", out_spec)
+            if in_dev is None and out_dev is None:
+                return
+
+            try:
+                cur_in, cur_out = sd.default.device  # type: ignore[misc]
+            except Exception:
+                cur_in, cur_out = (None, None)
+
+            new_in = in_dev if in_dev is not None else cur_in
+            new_out = out_dev if out_dev is not None else cur_out
+            try:
+                sd.default.device = (new_in, new_out)
+                # Helpful one-line confirmation (doesn't spam unless env set)
+                if os.getenv("LEKIWI_SD_INPUT_DEVICE") or os.getenv("LEKIWI_SD_OUTPUT_DEVICE") or os.getenv("LEKIWI_SD_DEVICE"):
+                    try:
+                        in_name = sd.query_devices(new_in).get("name") if new_in is not None else None
+                    except Exception:
+                        in_name = None
+                    try:
+                        out_name = sd.query_devices(new_out).get("name") if new_out is not None else None
+                    except Exception:
+                        out_name = None
+                    logger.info(
+                        "sounddevice: forced default.device=(%r,%r) input=%r output=%r",
+                        new_in,
+                        new_out,
+                        in_name,
+                        out_name,
+                    )
+            except Exception as e:
+                logger.warning("sounddevice: failed to set default.device (%s)", e)
+
+        def _pick_portaudio_device(kind: str, *, prefer: list[str]) -> "int | None":
+            """
+            Pick a PortAudio device index by substring preference.
+            This is primarily used as a safe fallback on Linux when a raw ALSA "hw:*"
+            device refuses the requested sample rate (e.g. 16kHz) but PipeWire can
+            resample transparently.
+            """
+            try:
+                import sounddevice as sd  # type: ignore
+
+                devices = sd.query_devices()
+                for want in prefer:
+                    want_l = (want or "").lower().strip()
+                    if not want_l:
+                        continue
+                    for idx, d in enumerate(devices):
+                        name = str(d.get("name", "")).lower()
+                        if want_l not in name:
+                            continue
+                        if kind == "input" and int(d.get("max_input_channels", 0)) > 0:
+                            return idx
+                        if kind == "output" and int(d.get("max_output_channels", 0)) > 0:
+                            return idx
+            except Exception:
+                return None
+            return None
+
         def safe_update_microphone(self, *, enable: bool) -> None:  # type: ignore[no-redef]
             # Allow forcing text-only via env
             if os.getenv("LEKIWI_CONSOLE_TEXT_ONLY", "0") == "1":
                 _force_text_mode(self)
                 return
             try:
+                _apply_sounddevice_overrides()
                 return orig_mic(self, enable=enable)
             except OSError as e:
-                # Common: "PortAudio library not found"
+                # Common on Linux when a raw ALSA device is chosen:
+                # "Error opening InputStream: Invalid sample rate [PaErrorCode -9997]"
+                msg = str(e)
+                if ("Invalid sample rate" in msg) or ("-9997" in msg):
+                    try:
+                        import sounddevice as sd  # type: ignore
+
+                        cur_in, cur_out = sd.default.device  # type: ignore[misc]
+                        pw_in = _pick_portaudio_device(
+                            "input", prefer=["pipewire", "default"]
+                        )
+                        if pw_in is not None:
+                            sd.default.device = (pw_in, cur_out)
+                            logger.info(
+                                "LiveKit console: retrying microphone with PortAudio device=%r (PipeWire/default) after sample-rate failure (%s)",
+                                pw_in,
+                                msg,
+                            )
+                            return orig_mic(self, enable=enable)
+                    except Exception:
+                        pass
+
                 logger.warning(f"LiveKit console: microphone disabled ({e})")
+                logger.warning(
+                    "Tip (Linux): ensure your PipeWire default input is the right mic. "
+                    "Run `wpctl status` then `wpctl set-default <source-id>`."
+                )
                 _force_text_mode(self)
             except Exception as e:
                 logger.warning(f"LiveKit console: microphone disabled ({e})")
@@ -631,6 +808,7 @@ if __name__ == "__main__":
                 _force_text_mode(self)
                 return
             try:
+                _apply_sounddevice_overrides()
                 return orig_spk(self, enable=enable)
             except OSError as e:
                 logger.warning(f"LiveKit console: speaker disabled ({e})")

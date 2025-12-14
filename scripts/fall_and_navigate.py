@@ -76,7 +76,7 @@ def main():
     parser.add_argument(
         "--port",
         type=str,
-        default="/dev/tty.usbmodem58760432781",
+        default="/dev/ttyACM0",
         help="Serial port for the robot",
     )
     parser.add_argument("--id", type=str, default="biden_kiwi", help="ID of the robot")
@@ -119,7 +119,7 @@ def main():
     parser.add_argument(
         "--navigation-timeout",
         type=float,
-        default=15.0,
+        default=8.0,
         help="Maximum time to spend navigating to person",
     )
     args = parser.parse_args()
@@ -176,9 +176,9 @@ def main():
     backoff_start_time = None
 
     # Navigation timeouts
-    alignment_timeout = 10.0
+    alignment_timeout = 8.0
     approach_timeout = args.navigation_timeout
-    backoff_duration = 1.0
+    backoff_duration = 1.5
 
     logger.info("Starting fall detection. Press 'q' to quit.")
 

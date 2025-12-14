@@ -8,6 +8,7 @@ import sounddevice as sd
 import os
 import tempfile
 import scipy.io.wavfile as wav
+import cv2
 
 # Set logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,7 +20,7 @@ from lekiwi.robot.lekiwi import LeKiwi
 from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 
 from lekiwi.services.pose_detection.pose_service import PoseDetectionService
-from lekiwi.services.navigation.navigator import Navigator
+from nav.nav import CombinedNavigator
 from lekiwi.services.epipen.lerobot_record_service import LeRobotRecordConfig, LeRobotRecordService
 from lekiwi.vision.camera_hub import CameraHub
 from lekiwi.viz.rerun_viz import create_viz
@@ -28,6 +29,26 @@ from lekiwi.viz.rerun_viz import create_viz
 SAMPLE_RATE = 16000
 CHANNELS = 1
 AUDIO_DEVICE = 0
+
+class RotatedSubscription:
+    """Wrap a CameraHub subscription and rotate frames before returning them."""
+
+    def __init__(self, sub, *, rotate_180: bool = False):
+        self._sub = sub
+        self._rotate_180 = rotate_180
+
+    def pull(self, timeout: float = 0.1):
+        pulled = self._sub.pull(timeout=timeout)
+        if pulled is None:
+            return None
+        ts, frame = pulled
+        if self._rotate_180:
+            try:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            except Exception:
+                pass
+        return ts, frame
+
 
 class MockRobot:
     """Mock robot for testing logic without hardware."""
@@ -60,6 +81,9 @@ class Sentry:
     def __init__(self):
         self.state = "NORMAL" # NORMAL, CONCERN, EMERGENCY
         self.running = True
+
+        # Serialize base motor commands across background threads (tracking vs navigation vs emergency)
+        self.robot_lock = threading.Lock()
         
         # --- Robot Setup ---
         # Initialize LeKiwi without cameras (handled by CameraHub for vision services)
@@ -86,7 +110,10 @@ class Sentry:
         
         # Pose Detection Service
         # Subscribes to front camera frames
-        self.pose_sub = self.camera_hub.subscribe_front(max_queue=2)
+        self.pose_sub = RotatedSubscription(
+            self.camera_hub.subscribe_front(max_queue=2),
+            rotate_180=True,
+        )
         self.pose_service = PoseDetectionService(
             status_callback=self._handle_pose_status,
             frame_subscription=self.pose_sub,
@@ -94,13 +121,30 @@ class Sentry:
         )
         
         # Navigator Service
-        # Also subscribes to front camera frames
-        self.nav_sub = self.camera_hub.subscribe_front(max_queue=2)
-        self.navigator = Navigator(
-            robot=self.robot,
-            frame_subscription=self.nav_sub,
-            viz=self.viz
+        # Always-on navigation tracking (NORMAL state): warms models + maintains last-known thigh/distance.
+        self.nav_track_sub = RotatedSubscription(
+            self.camera_hub.subscribe_front(max_queue=2),
+            rotate_180=True,
         )
+
+        # Navigation execution subscription (CONCERN state): separate queue so tracking doesn't starve driving.
+        self.nav_sub = RotatedSubscription(
+            self.camera_hub.subscribe_front(max_queue=2),
+            rotate_180=True,
+        )
+
+        self.navigator = CombinedNavigator(
+            self.robot,
+            robot_lock=self.robot_lock,
+            frame_subscription=self.nav_sub,
+            viz=self.viz,
+            rotate_180=False,  # already rotated by RotatedSubscription
+        )
+
+        # Tracking thread control
+        self._nav_tracking_enabled = threading.Event()
+        self._nav_tracking_enabled.set()
+        threading.Thread(target=self._nav_track_loop, daemon=True, name="nav-track").start()
         
         # Emergency epipen: run the official LeRobot script as a subprocess.
         # IMPORTANT: this subprocess will open the serial port + cameras itself, so we must
@@ -180,6 +224,10 @@ class Sentry:
             
     def stop(self):
         logger.info("Stopping services...")
+        try:
+            self._nav_tracking_enabled.clear()
+        except Exception:
+            pass
         self.pose_service.stop()
         self.camera_hub.stop()
         if self.viz:
@@ -225,13 +273,50 @@ class Sentry:
         else:
             time.sleep(0.1)
 
+    def _nav_track_loop(self):
+        """
+        Continuously track thigh + distance in NORMAL state (no robot motion).
+        This keeps the models warm and provides a better warm-start when a fall happens.
+        """
+        while self.running:
+            if not self._nav_tracking_enabled.is_set():
+                time.sleep(0.1)
+                continue
+            if self.state != "NORMAL":
+                time.sleep(0.05)
+                continue
+            pulled = self.nav_track_sub.pull(timeout=0.2)
+            if pulled is None:
+                continue
+            ts, frame = pulled
+            try:
+                self.navigator.track_step(frame, ts=ts)
+                # Rotate in place to keep the person centered during NORMAL state
+                self.navigator.center_person_step(
+                    rotation_kp=5,
+                    rotation_deadzone=0.08,
+                    max_theta_vel=20.0,
+                    min_conf=0.5,
+                    tracking_fresh_s=0.5,
+                )
+            except Exception:
+                # Best-effort tracking only; never break sentry loop.
+                pass
+            # Avoid maxing out CPU/GPU; tracking does not need full FPS.
+            time.sleep(0.05)
+
     def _run_concern(self):
         """Handle potential emergency: Navigate, Assess, React."""
         logger.info("Entering CONCERN mode")
+        # Pause tracking while driving to avoid competing for compute/frames.
+        try:
+            self._nav_tracking_enabled.clear()
+        except Exception:
+            pass
         
         # 1. Navigate to person
         logger.info("Navigating to person...")
-        nav_result = self.navigator.navigate_to_person()
+        nav_result = self.navigator.navigate_to_person(warm_start_from_tracking=True)
         logger.info(f"Navigation result: {nav_result}")
         
         # 2. Verbal confirmation

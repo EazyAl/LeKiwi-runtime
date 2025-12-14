@@ -33,4 +33,4 @@ lerobot = { git = "https://github.com/huggingface/lerobot.git" }
 lekiwi-host = "lekiwi.host:main"
 
 [tool.setuptools]
-packages = ["lekiwi"]
+packages = ["lekiwi", "nav"]
